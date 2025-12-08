@@ -49,80 +49,98 @@ class resnetBlock(nn.Module):
     return x + h
 
 
-def attn_block(x, *, name, temb):
-  B, H, W, C = x.shape
-  with tf.variable_scope(name):
-    h = normalize(x, temb=temb, name='norm')
-    q = nn.nin(h, name='q', num_units=C)
-    k = nn.nin(h, name='k', num_units=C)
-    v = nn.nin(h, name='v', num_units=C)
+class attn_block(nn.Module):
+  def __init__(self, num_channels):
+    super().__init__(num_channels)
+    self.norm = normalize(num_channels=num_channels)
+    self.q = nn.Conv2d(num_channels,num_channels,1)
+    self.k = nn.Conv2d(num_channels,num_channels,1)
+    self.v = nn.Conv2d(num_channels,num_channels,1)
+    self.proj_out = nn.Conv2d(num_channels,num_channels,1)
 
-    w = tf.einsum('bhwc,bHWc->bhwHW', q, k) * (int(C) ** (-0.5))
-    w = tf.reshape(w, [B, H, W, H * W])
-    w = tf.nn.softmax(w, -1)
-    w = tf.reshape(w, [B, H, W, H, W])
+  def forward(self, x, temb):
+    B, H, W, C = x.shape
+  
+    h = self.norm(x)
+    q = self.q(h)
+    k = self.k(h)
+    v = self.v(h)
 
-    h = tf.einsum('bhwHW,bHWc->bhwc', w, v)
-    h = nn.nin(h, name='proj_out', num_units=C, init_scale=0.)
+    w = torch.einsum('bhwc,bHWc->bhwHW', q, k) * (int(C) ** (-0.5))
+    w = torch.reshape(w, [B, H, W, H * W])
+    w = torch.nn.functional.softmax(w, -1)
+    w = torch.reshape(w, [B, H, W, H, W])
+
+    h = torch.einsum('bhwHW,bHWc->bhwc', w, v)
+    h = self.proj_out(h)
 
     assert h.shape == x.shape
-    print(tf.get_default_graph().get_name_scope(), x.shape)
+    # print(tf.get_default_graph().get_name_scope(), x.shape)
     return x + h
 
 
-def model(x, *, t, y, name, num_classes, reuse=tf.AUTO_REUSE, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
-          attn_resolutions, dropout=0., resamp_with_conv=True):
-  B, S, _, _ = x.shape
-  assert x.dtype == tf.float32 and x.shape[2] == S
-  assert t.dtype in [tf.int32, tf.int64]
-  num_resolutions = len(ch_mult)
+class model(nn.Module):
+  def __init__(self,t_emb_dim,ch,out_ch,ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_resolutions=(16,),
+          dropout=0.8, resamp_with_conv=True):
+    super().__init__()
+    #Time embedding layers
+    self.tmb_layers = nn.ModuleList([nn.Linear(t_emb_dim, t_emb_dim * 4),nonlinearity(),nn.Linear(t_emb_dim * 4, t_emb_dim * 4)])
 
-  assert num_classes == 1 and y is None, 'not supported'
-  del y
+    #Downsampling layers
+    self.in_conv = nn.Conv2d(3, ch, 3, padding=1)
+    downs = []
+    num_muls = len(ch_mult)
+    for i in range(num_muls):
+      for _ in range(num_res_blocks):
+        downs.append(resnetBlock(in_ch=ch, out_ch=ch * ch_mult[i], dropout=dropout))
+          ch = ch * ch_mult[i]
+      if (2 ** i) in attn_resolutions:
+        downs.append(attn_block(num_channels=ch))
+      if i != num_muls - 1:
+        downs.append(downsampleBlock(in_channel=ch,out_channel=ch,with_conv=resamp_with_conv))
 
-  with tf.variable_scope(name, reuse=reuse):
+    self.down_layers = nn.ModuleList(downs)
+
+    #Middle layers
+    self.middle_layers = nn.ModuleList([
+      resnetBlock(in_ch=ch, out_ch=ch, dropout=dropout),
+      attn_block(num_channels=ch),
+      resnetBlock(in_ch=ch, out_ch=ch, dropout=dropout)
+    ])
+
+    #Upsampling layers
+    ups = []
+    for i in reversed(range(num_muls)):
+      for _ in range(num_res_blocks + 1):
+        ups.append(resnetBlock(in_ch=ch * 2, out_ch=ch // ch_mult[i], dropout=dropout))
+        ch = ch // ch_mult[i]
+      if (2 ** i) in attn_resolutions:
+        ups.append(attn_block(num_channels=ch))
+      if i != 0:
+        ups.append(upsampleBlock(in_channel=ch,out_channel=ch,with_conv=resamp_with_conv))
+
+  def forward(self, x, *, t, num_classes, reuse=tf.AUTO_REUSE):
+    B, S, _, _ = x.shape
+    # assert x.dtype == tf.float32 and x.shape[2] == S
+    # assert t.dtype in [tf.int32, tf.int64]
+
     # Timestep embedding
-    with tf.variable_scope('temb'):
-      temb = nn.get_timestep_embedding(t, ch)
-      temb = nn.dense(temb, name='dense0', num_units=ch * 4)
-      temb = nn.dense(nonlinearity(temb), name='dense1', num_units=ch * 4)
-      assert temb.shape == [B, ch * 4]
+    temb = utils.get_timestep_embedding(t, self.t_emb_dim)
+    temb = self.tmb_layers(temb)
 
     # Downsampling
     hs = [nn.conv2d(x, name='conv_in', num_units=ch)]
-    for i_level in range(num_resolutions):
-      with tf.variable_scope('down_{}'.format(i_level)):
-        # Residual blocks for this resolution
-        for i_block in range(num_res_blocks):
-          h = resnet_block(
-            hs[-1], name='block_{}'.format(i_block), temb=temb, out_ch=ch * ch_mult[i_level], dropout=dropout)
-          if h.shape[1] in attn_resolutions:
-            h = attn_block(h, name='attn_{}'.format(i_block), temb=temb)
-          hs.append(h)
-        # Downsample
-        if i_level != num_resolutions - 1:
-          hs.append(downsample(hs[-1], name='downsample', with_conv=resamp_with_conv))
-
+    for block in self.down_layers:
+        h  = block(hs[-1], temb=temb)
+        hs.append(h)
+      
     # Middle
-    with tf.variable_scope('mid'):
-      h = hs[-1]
-      h = resnet_block(h, temb=temb, name='block_1', dropout=dropout)
-      h = attn_block(h, name='attn_1'.format(i_block), temb=temb)
-      h = resnet_block(h, temb=temb, name='block_2', dropout=dropout)
+    for block in self.middle_layers:
+        h = block(h, temb=temb)
 
     # Upsampling
-    for i_level in reversed(range(num_resolutions)):
-      with tf.variable_scope('up_{}'.format(i_level)):
-        # Residual blocks for this resolution
-        for i_block in range(num_res_blocks + 1):
-          h = resnet_block(tf.concat([h, hs.pop()], axis=-1), name='block_{}'.format(i_block),
-                           temb=temb, out_ch=ch * ch_mult[i_level], dropout=dropout)
-          if h.shape[1] in attn_resolutions:
-            h = attn_block(h, name='attn_{}'.format(i_block), temb=temb)
-        # Upsample
-        if i_level != 0:
-          h = upsample(h, name='upsample', with_conv=resamp_with_conv)
-    assert not hs
+    for block in self.up_layers:
+      h = block(tf.concat([h, hs.pop()], axis=-1), temb=temb)
 
     # End
     h = nonlinearity(normalize(h, temb=temb, name='norm_out'))
