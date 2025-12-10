@@ -103,16 +103,16 @@ for epoch in range(50_000):
                t = torch.ones(images.shape[0], device=device).long()
                
                res = model(img,t)
+               res = torch.reshape(res,[b,c,-1])
                img = torch.reshape(img,[b,c,-1])
-               U, S, Yt = torch.linalg.svd(img)
+               U, S, Vt = torch.linalg.svd(img)
                S = torch.diag_embed(S)
                k = S.shape[1]
                output = img - U@res
-               
-               print(f"max U@res: {max(U@res)}, min U@res: {min(U@res)}")
+               print(f"max U@res: {torch.max(U@res)}, min U@res: {torch.min(U@res)}")
 
-               img = torch.reshape(img,[b,c,h,w])
-               output = torch.reshape(output,[b,c,h,w])
+               img = torch.reshape(img,[b,c,h,w]).cpu().numpy()
+               output = torch.reshape(output,[b,c,h,w]).cpu().numpy()
                # Inception score
                # metrics['{}/inception{}'.format(samples_key, self.num_inception_samples)] = float(
                # classifier_metrics_numpy.classifier_score_from_logits(inception_gen['logits']))
@@ -123,5 +123,6 @@ for epoch in range(50_000):
                #    cached_inception_real_train['pool_3'], inception_gen['pool_3']))
 
                # FID vs val set
+               breakpoint()
                
                print(f"FID vs val set:{float(classifier_metrics_numpy.frechet_classifier_distance_from_activations(output, img))}")
