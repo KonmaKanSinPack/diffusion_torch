@@ -114,8 +114,18 @@ class attn_block(nn.Module):
 
 
 class UNet(nn.Module):
-  def __init__(self, t_emb_dim, ch, out_ch, ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_resolutions=(16,),
-             dropout=0.1, resamp_with_conv=True):
+  def __init__(
+      self,
+      t_emb_dim,
+      ch,
+      out_ch,
+      ch_mult=(1, 2, 2, 2),
+      num_res_blocks=2,
+      attn_resolutions=(16,),
+      dropout=0.1,
+      resamp_with_conv=True,
+      in_ch=3,
+  ):
     super().__init__()
 
     # Time embedding layers
@@ -128,7 +138,7 @@ class UNet(nn.Module):
     self.with_conv = resamp_with_conv
 
     # Downsampling layers
-    self.in_conv = nn.Conv2d(3, ch, 3, padding=1)
+    self.in_conv = nn.Conv2d(in_ch, ch, 3, padding=1)
     downs = []
     num_muls = len(ch_mult)
     current_ch = ch
@@ -220,7 +230,7 @@ class UNet(nn.Module):
     h = nonlinearity()(h)
     h = self.out_conv(h)
 
-    assert h.shape == x.shape, f"h.shape: {h.shape}, x.shape: {x.shape}, not equal"
+    assert h.shape == (B, self.out_ch, H, W), f"h.shape: {h.shape}, expected: {(B, self.out_ch, H, W)}"
     return h
   
   def get_timestep_embedding(self, timesteps, embedding_dim):
