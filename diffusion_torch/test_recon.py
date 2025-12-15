@@ -184,6 +184,6 @@ for epoch in tqdm(range(50000), desc="Training Epochs"):
             pad_recon = F.pad(reconstructed, (2, 2, 0, 0), 'constant', 1)
             
             sav_img = torch.cat([pad_img, pad_low, pad_recon], dim=3)
-            save_image(sav_img, f"result_{epoch}.jpg", normalize=True)
+            save_image(sav_img, f"recon_result_{epoch}.jpg", normalize=True)
             break
       model.train()
