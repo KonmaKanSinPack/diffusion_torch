@@ -49,6 +49,12 @@ def grad_clip(params, mode: str = "value", value: float = None, **kwargs) -> Non
     else:  # mode == 'value'
         nn.utils.clip_grad.clip_grad_value_(parameters=params, clip_value=value)
 
+def get_i_th_singular_vectors(x, i):
+   U, S, Vt = torch.linalg.svd(x)
+   S = torch.diag_embed(S)
+   out = (U[:, :, :i] @ S[:, :i, :i] @ Vt[:, :i, :])
+   
+   return out
 transform = transforms.Compose([
    transforms.ToTensor(),
    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
@@ -84,70 +90,47 @@ for epoch in range(50_000):
          b, c, h, w = images.shape
          # print(f"padded image shape: {images.shape}")
       
-      
       images = torch.reshape(images,[b,c,-1])
-      U,S,Vt = torch.linalg.svd(images)
-      S = torch.diag_embed(S)
-      U_inv = torch.linalg.pinv(U)
-      UH = U_inv@images
-      k = S.shape[1]
-      res = S@Vt[:,:k,:]-UH
+      pred_img = torch.randn_like(images)
+      for i in range(3):
+         pred_img = torch.reshape(pred_img,[b,c,-1])
+         out_i = get_i_th_singular_vectors(images, i+1)
+         U, S, Vt = torch.linalg.svd(pred_img)
+         S = torch.diag_embed(S)
+         # U_in, _, _ = torch.linalg.svd(pred_img)
+         U_inv = torch.linalg.pinv(U)
+         # breakpoint()
+         UH = U_inv@out_i
+         k = S.shape[1]
+         res = S@Vt[:,:k,:]-UH
+         t = (i+1)*torch.ones(out_i.shape[0], device=device).long()
+         pred_img = torch.reshape(pred_img,[b,c,h,w])
+         res = torch.reshape(res,[b,c,h,w])
+         output = model(pred_img, t)
 
-      t = torch.ones(images.shape[0], device=device).long()
-      images = torch.reshape(images,[b,c,h,w])
-      res = torch.reshape(res,[b,c,h,w])
-      output = model(images, t)
+         loss = loss_func(output, res)
+         # loss = loss_func(pred_U, U)
+         opt_d.zero_grad()
+         loss.backward()
+         grad_clip(model.parameters(), mode="norm", value=0.003)
+         opt_d.step()
 
-      loss = loss_func(output, res)
-      opt_d.zero_grad()
-      loss.backward()
-      grad_clip(model.parameters(), mode="norm", value=0.003)
-      opt_d.step()
+         pred_res = torch.reshape(output,[b,c,-1]).detach()
+         pred_img = torch.reshape(pred_img,[b,c,-1]).detach()
+         U_out, _, _ = torch.linalg.svd(pred_img)
+         S = torch.diag_embed(S)
+         k = S.shape[1]
+         pred_img = pred_img - U_out@pred_res
+         # print(f"max U@res: {torch.max(U@res)}, min U@res: {torch.min(U@res)}")
+
+         pred_img = torch.reshape(pred_img,[b,c,h,w])#.cpu().numpy()
+         output = torch.reshape(output,[b,c,h,w])#.cpu().numpy()
       # ema_updater.update(epoch)
+   print(f"epoch {epoch} completed")
 
-   if epoch % 1000 == 0:
-      # Compute FID and Inception score
-      model.eval()
-      with torch.no_grad():
-         for img, _ in testloader:
-            img = img.to(device)
-            b, c, h, w = img.shape
-            if h != w and do_pad:
-               print("do padding for this image")
-               if h > w:
-                  diff = h - w
-                  img = F.pad(img, (diff//2, diff - diff//2, 0, 0), "constant", 0)
-               else:
-                  diff = w - h
-                  img = F.pad(img, (0, 0, diff//2, diff - diff//2), "constant", 0)
-               b, c, h, w = img.shape
-               print(f"padded image shape: {img.shape}")
-            
-            t = torch.ones(img.shape[0], device=device).long()
-            
-            res = model(img,t)
-            res = torch.reshape(res,[b,c,-1])
-            img = torch.reshape(img,[b,c,-1])
-            U, S, Vt = torch.linalg.svd(img)
-            S = torch.diag_embed(S)
-            k = S.shape[1]
-            output = img - U@res
-            # print(f"max U@res: {torch.max(U@res)}, min U@res: {torch.min(U@res)}")
-
-            img = torch.reshape(img,[b,c,h,w])#.cpu().numpy()
-            output = torch.reshape(output,[b,c,h,w])#.cpu().numpy()
-            # Inception score
-            # metrics['{}/inception{}'.format(samples_key, self.num_inception_samples)] = float(
-            # classifier_metrics_numpy.classifier_score_from_logits(inception_gen['logits']))
-
-            # # FID vs training set
-            # metrics['{}/trainfid{}'.format(samples_key, self.num_inception_samples)] = float(
-            # classifier_metrics_numpy.frechet_classifier_distance_from_activations(
-            #    cached_inception_real_train['pool_3'], inception_gen['pool_3']))
-
-            # FID vs val set
-            # breakpoint()
-            pad_img = F.pad(img,(2,2,0,0),'constant',1)
-            
-            sav_img = torch.cat([pad_img,output],dim=3)
-            save_image(sav_img,f"result_{epoch}.jpg")
+   if epoch % 10 == 0:   
+      images = torch.reshape(images,[b,c,h,w])
+      pad_img = F.pad(images,(2,2,0,0),'constant',1)
+      
+      sav_img = torch.cat([pad_img,pred_img],dim=3)
+      save_image(sav_img,f"result_{epoch}.jpg")
