@@ -26,6 +26,24 @@ The prefix should be passed into the scripts using the `--bucket_name_prefix` fl
 
 Models and samples can be found at: https://www.dropbox.com/sh/pm6tn31da21yrx4/AABWKZnBzIROmDjGxpB6vn6Ja
 
+## Torch: Conditional b-space DDPM (SVD residual)
+
+This repo also contains a minimal PyTorch prototype that implements the idea:
+
+- Build a low-rank conditional image $I_L$ by truncating singular values of $I_H$
+- Define residual in SVD basis of $I_L$: $b = U_L^T (I_H - I_L)$
+- Train a conditional DDPM in b-space to sample $b$ from Gaussian noise
+- Reconstruct: $I_{out} = I_L + U_L b$
+
+Run:
+
+```bash
+python3 diffusion_torch/diffusion_torch/train_b_diffusion.py \
+    --epochs 200 --batch 64 --k_truncate 16 --timesteps 1000 --save_every 10
+```
+
+Output preview image defaults to `b_diffusion_recon.jpg` (original | low-rank | reconstructed).
+
 ## Citation
 If you find our work relevant to your research, please cite:
 ```
