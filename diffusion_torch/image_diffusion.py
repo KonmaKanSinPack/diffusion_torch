@@ -189,6 +189,71 @@ class ImageDDPM:
 
         return x
 
+    @torch.no_grad()
+    def ddim_denoise_from(
+        self,
+        *,
+        model,
+        x_t: torch.Tensor,
+        t_start: torch.Tensor,
+        steps: int = 25,
+        eta: float = 0.0,
+        clip_x0: bool = True,
+    ) -> torch.Tensor:
+        """DDIM denoise starting from a provided x_t at timestep t_start.
+
+        This is useful for "conditioning augmentation": take a real target x0,
+        noise it to x_t, then denoise with a trained model to get a model-like sample.
+        """
+        if t_start.dtype != torch.long:
+            t_start = t_start.long()
+        if t_start.dim() != 1:
+            raise ValueError(f"t_start must have shape [B], got {t_start.shape}")
+        if steps <= 0:
+            raise ValueError(f"steps must be > 0, got {steps}")
+
+        # We only support a single shared start timestep for simplicity.
+        if not torch.all(t_start == t_start[0]):
+            raise ValueError("ddim_denoise_from currently requires all t_start equal within batch")
+
+        t0 = int(t_start[0].item())
+        if t0 < 0 or t0 >= self.params.timesteps:
+            raise ValueError(f"t_start out of range: {t0}")
+
+        steps = min(int(steps), t0 + 1)
+        t_seq = torch.linspace(0, t0, steps, device=self.device)
+        t_seq = torch.round(t_seq).long().unique(sorted=True).flip(0)  # descending to 0
+
+        x = x_t
+        bsz = x.shape[0]
+        for idx, t_val in enumerate(t_seq):
+            t = torch.full((bsz,), int(t_val.item()), device=self.device, dtype=torch.long)
+            eps = model(x, t)
+            x0 = self.predict_x0_from_eps(x_t=x, t=t, eps=eps)
+            if clip_x0:
+                x0 = x0.clamp(-1.0, 1.0)
+
+            if idx == len(t_seq) - 1:
+                x = x0
+                break
+
+            t_prev_val = int(t_seq[idx + 1].item())
+            t_prev = torch.full((bsz,), t_prev_val, device=self.device, dtype=torch.long)
+
+            alpha_bar_t = _extract(self.alphas_cumprod, t, x.shape)
+            alpha_bar_prev = _extract(self.alphas_cumprod, t_prev, x.shape)
+
+            sigma = (
+                eta
+                * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
+                * torch.sqrt((1.0 - alpha_bar_t / alpha_bar_prev).clamp(min=0.0))
+            )
+            noise = torch.randn_like(x)
+            pred_dir = torch.sqrt((1.0 - alpha_bar_prev - sigma**2).clamp(min=0.0)) * eps
+            x = torch.sqrt(alpha_bar_prev) * x0 + pred_dir + sigma * noise
+
+        return x
+
     def training_loss(self, *, model, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x_start)
