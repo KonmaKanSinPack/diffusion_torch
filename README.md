@@ -44,6 +44,48 @@ python3 diffusion_torch/diffusion_torch/train_b_diffusion.py \
 
 Output preview image defaults to `b_diffusion_recon.jpg` (original | low-rank | reconstructed).
 
+## Torch: Two-stage unconditional generation + FID (CIFAR10)
+
+To get fully unconditional sampling while keeping the SVD residual idea:
+
+1) Train an unconditional DDPM to generate low-rank images $I_L$.
+2) Train a conditional DDPM in b-space to sample $b \sim p(b\mid I_L)$.
+3) Sample with DDIM for speed and compute FID.
+
+Train stage-1 ($I_L$ model):
+
+```bash
+python3 diffusion_torch/diffusion_torch/train_il_diffusion.py \
+    --epochs 200 --batch 128 --k_truncate 16 \
+    --timesteps 1000 --beta_schedule cosine \
+    --sample_steps 50 --save_every 10 --ckpt il_ddpm_ckpt.pt
+```
+
+Train stage-2 (b-space conditional model):
+
+```bash
+python3 diffusion_torch/diffusion_torch/train_b_diffusion.py \
+    --epochs 200 --batch 64 --k_truncate 16 \
+    --timesteps 1000 --beta_schedule cosine \
+    --sample_steps 50 --save_every 10 --ckpt b_ddpm_ckpt.pt
+```
+
+Unconditional two-stage sampling (noise -> $I_L$ -> $b$ -> $I_{out}$):
+
+```bash
+python3 diffusion_torch/diffusion_torch/two_stage_sample.py \
+    --il_ckpt il_ddpm_ckpt.pt --b_ckpt b_ddpm_ckpt.pt \
+    --n 64 --sample_steps 50 --out two_stage_samples.jpg
+```
+
+FID on CIFAR10 using torchvision Inception features (caches real activations):
+
+```bash
+python3 diffusion_torch/diffusion_torch/eval_fid_two_stage.py \
+    --il_ckpt il_ddpm_ckpt.pt --b_ckpt b_ddpm_ckpt.pt \
+    --num 10000 --sample_steps 50 --real_split train
+```
+
 ## Citation
 If you find our work relevant to your research, please cite:
 ```
