@@ -22,7 +22,6 @@ def make_beta_schedule(
     if schedule == "linear":
         betas = torch.linspace(beta_start, beta_end, timesteps, device=device, dtype=dtype)
     elif schedule == "cosine":
-        # Improved DDPM cosine schedule (Nichol & Dhariwal).
         s = 0.008
         steps = timesteps + 1
         x = torch.linspace(0, timesteps, steps, device=device, dtype=dtype)
@@ -37,7 +36,6 @@ def make_beta_schedule(
 
 
 def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
-    """Extract a[t] and reshape to [B, 1, 1, 1]... to broadcast."""
     if t.dtype != torch.long:
         t = t.long()
     out = a.gather(0, t)
@@ -54,15 +52,8 @@ class DDPMParams:
     beta_end: float = 2e-2
 
 
-class ConditionalBDDPM:
-    """DDPM on b-space with a condition image (e.g., I_L).
-
-    Model signature expected: eps_pred = model(x_in, t)
-      - x_in: concat([cond, b_t]) along channel dim
-      - t: int64 tensor shape [B]
-
-    b_t is a 1-channel image-like tensor.
-    """
+class ImageDDPM:
+    """Unconditional DDPM for images, noise-prediction objective."""
 
     def __init__(
         self,
@@ -92,14 +83,11 @@ class ConditionalBDDPM:
 
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
 
-        # posterior variance q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (
             betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         ).clamp(min=1e-20)
 
-        # for posterior mean using eps-pred form
         self.posterior_mean_coef1 = betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.posterior_mean_coef2 = (
             (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas)
@@ -118,64 +106,32 @@ class ConditionalBDDPM:
             x_t - _extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * eps
         ) / _extract(self.sqrt_alphas_cumprod, t, x_t.shape)
 
-    def p_mean_variance(
-        self,
-        *,
-        model,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        cond: torch.Tensor,
-        clip_x0: bool = False,
-    ):
-        x_in = torch.cat([cond, x_t], dim=1)
-        eps_pred = model(x_in, t)
-
+    def p_mean_variance(self, *, model, x_t: torch.Tensor, t: torch.Tensor, clip_x0: bool = True):
+        eps_pred = model(x_t, t)
         x0_pred = self.predict_x0_from_eps(x_t=x_t, t=t, eps=eps_pred)
         if clip_x0:
             x0_pred = x0_pred.clamp(-1.0, 1.0)
-
         mean = _extract(self.posterior_mean_coef1, t, x_t.shape) * x0_pred + _extract(
             self.posterior_mean_coef2, t, x_t.shape
         ) * x_t
         var = _extract(self.posterior_variance, t, x_t.shape)
-        return mean, var, x0_pred, eps_pred
+        return mean, var, x0_pred
 
     @torch.no_grad()
-    def p_sample(
-        self,
-        *,
-        model,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        cond: torch.Tensor,
-        clip_x0: bool = False,
-    ) -> torch.Tensor:
-        mean, var, _, _ = self.p_mean_variance(model=model, x_t=x_t, t=t, cond=cond, clip_x0=clip_x0)
+    def p_sample(self, *, model, x_t: torch.Tensor, t: torch.Tensor, clip_x0: bool = True) -> torch.Tensor:
+        mean, var, _ = self.p_mean_variance(model=model, x_t=x_t, t=t, clip_x0=clip_x0)
         if (t == 0).all():
             return mean
         noise = torch.randn_like(x_t)
         return mean + torch.sqrt(var) * noise
 
     @torch.no_grad()
-    def sample_loop(
-        self,
-        *,
-        model,
-        shape: torch.Size,
-        cond: torch.Tensor,
-        clip_x0: bool = False,
-        return_all: bool = False,
-    ):
+    def sample_loop(self, *, model, shape: torch.Size, clip_x0: bool = True) -> torch.Tensor:
         x = torch.randn(shape, device=self.device, dtype=self.dtype)
-        all_steps = [x] if return_all else None
-
         for step in reversed(range(self.params.timesteps)):
             t = torch.full((shape[0],), step, device=self.device, dtype=torch.long)
-            x = self.p_sample(model=model, x_t=x, t=t, cond=cond, clip_x0=clip_x0)
-            if return_all:
-                all_steps.append(x)
-
-        return (x, all_steps) if return_all else x
+            x = self.p_sample(model=model, x_t=x, t=t, clip_x0=clip_x0)
+        return x
 
     @torch.no_grad()
     def ddim_sample_loop(
@@ -183,26 +139,30 @@ class ConditionalBDDPM:
         *,
         model,
         shape: torch.Size,
-        cond: torch.Tensor,
         steps: int = 50,
         eta: float = 0.0,
-        clip_x0: bool = False,
+        clip_x0: bool = True,
     ) -> torch.Tensor:
+        """DDIM sampling with a reduced number of steps.
+
+        - steps: number of sampling steps (<= timesteps)
+        - eta: 0.0 => deterministic DDIM; >0 adds noise
+        """
         if steps <= 0:
             raise ValueError(f"steps must be > 0, got {steps}")
         T = self.params.timesteps
         steps = min(int(steps), int(T))
 
+        # Pick a monotone decreasing set of timesteps.
         t_seq = torch.linspace(0, T - 1, steps, device=self.device)
         t_seq = torch.round(t_seq).long().unique(sorted=True)
-        t_seq = t_seq.flip(0)
+        t_seq = t_seq.flip(0)  # descending
 
         x = torch.randn(shape, device=self.device, dtype=self.dtype)
         for idx, t_val in enumerate(t_seq):
             t = torch.full((shape[0],), int(t_val.item()), device=self.device, dtype=torch.long)
 
-            x_in = torch.cat([cond, x], dim=1)
-            eps = model(x_in, t)
+            eps = model(x, t)
             x0 = self.predict_x0_from_eps(x_t=x, t=t, eps=eps)
             if clip_x0:
                 x0 = x0.clamp(-1.0, 1.0)
@@ -217,6 +177,7 @@ class ConditionalBDDPM:
             alpha_bar_t = _extract(self.alphas_cumprod, t, x.shape)
             alpha_bar_prev = _extract(self.alphas_cumprod, t_prev, x.shape)
 
+            # DDIM sigma
             sigma = (
                 eta
                 * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
@@ -228,18 +189,9 @@ class ConditionalBDDPM:
 
         return x
 
-    def training_loss(
-        self,
-        *,
-        model,
-        x_start: torch.Tensor,
-        cond: torch.Tensor,
-        t: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def training_loss(self, *, model, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_in = torch.cat([cond, x_t], dim=1)
-        eps_pred = model(x_in, t)
+        eps_pred = model(x_t, t)
         return F.mse_loss(eps_pred, noise)

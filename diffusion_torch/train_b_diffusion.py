@@ -17,6 +17,7 @@ if _THIS_DIR not in sys.path:
 
 from models.unet import UNet
 from b_diffusion import ConditionalBDDPM, DDPMParams
+from ema import EMA, save_checkpoint, load_checkpoint
 
 
 def grad_clip(params, mode: str = "norm", value: float = 1.0, **kwargs) -> None:
@@ -87,6 +88,11 @@ def main():
     parser.add_argument("--k_truncate", type=int, default=16)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--beta_schedule", type=str, default="linear", choices=["linear", "cosine"])
+    parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--ddim_eta", type=float, default=0.0)
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--ckpt", type=str, default="b_ddpm_ckpt.pt")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--out", type=str, default="b_diffusion_recon.jpg")
     args = parser.parse_args()
@@ -110,6 +116,7 @@ def main():
     # Model predicts eps in b-space. Input is [I_L (3ch), b_t (1ch)] => 4 channels.
     model = UNet(t_emb_dim=128, ch=64, out_ch=1, in_ch=4).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    ema = EMA(model, decay=args.ema_decay)
 
     ddpm = ConditionalBDDPM(
         params=DDPMParams(timesteps=args.timesteps, beta_schedule=args.beta_schedule),
@@ -120,6 +127,10 @@ def main():
     do_pad = True
 
     global_step = 0
+    if args.resume and os.path.exists(args.ckpt):
+        global_step = load_checkpoint(args.ckpt, model=model, opt=opt, ema=ema, map_location=device)
+        print(f"Resumed from {args.ckpt} at step {global_step}")
+
     for epoch in range(args.epochs):
         model.train()
         pbar = tqdm(trainloader, desc=f"Epoch {epoch}")
@@ -139,13 +150,17 @@ def main():
             loss.backward()
             grad_clip(model.parameters(), mode="norm", value=1.0)
             opt.step()
+            ema.update(model)
 
             global_step += 1
             pbar.set_postfix(loss=float(loss.item()), r=int(r_l))
 
         # quick sample visualization
         if (epoch + 1) % args.save_every == 0:
-            model.eval()
+            save_checkpoint(args.ckpt, model=model, opt=opt, ema=ema, step=global_step)
+
+            model_ema = ema.ema_model.to(device)
+            model_ema.eval()
             with torch.no_grad():
                 images, _ = next(iter(testloader))
                 images = images.to(device)
@@ -154,10 +169,13 @@ def main():
                     images=images, k_truncate=args.k_truncate, do_pad=do_pad
                 )
 
-                b_sample = ddpm.sample_loop(
-                    model=model,
+                # Faster sampling for preview
+                b_sample = ddpm.ddim_sample_loop(
+                    model=model_ema,
                     shape=torch.Size([images.shape[0], 1, r_l, images.shape[-1]]),
                     cond=I_L,
+                    steps=args.sample_steps,
+                    eta=args.ddim_eta,
                     clip_x0=False,
                 )
 
@@ -172,6 +190,7 @@ def main():
                 grid = torch.cat([pad_img, pad_low, pad_recon], dim=3)
                 save_image(grid, args.out, normalize=True)
                 print(f"Saved {args.out}")
+                print(f"Saved checkpoint {args.ckpt}")
 
 
 if __name__ == "__main__":
