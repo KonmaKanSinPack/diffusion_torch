@@ -142,23 +142,30 @@ class ImageDDPM:
         steps: int = 50,
         eta: float = 0.0,
         clip_x0: bool = True,
+        t_stop: int = 0,
+        init_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """DDIM sampling with a reduced number of steps.
 
         - steps: number of sampling steps (<= timesteps)
         - eta: 0.0 => deterministic DDIM; >0 adds noise
+        - t_stop: stop denoising at this timestep and return the predicted x0
+          from there (0 = full denoising all the way to t=0).
+        - init_noise: optional fixed initial noise tensor; useful for
+          paired experiments (same starting point, different t_stop values).
         """
         if steps <= 0:
             raise ValueError(f"steps must be > 0, got {steps}")
         T = self.params.timesteps
         steps = min(int(steps), int(T))
+        t_stop = max(0, min(int(t_stop), T - 1))
 
-        # Pick a monotone decreasing set of timesteps.
-        t_seq = torch.linspace(0, T - 1, steps, device=self.device)
+        # Build a monotone decreasing t_seq from T-1 down to t_stop.
+        t_seq = torch.linspace(t_stop, T - 1, steps, device=self.device)
         t_seq = torch.round(t_seq).long().unique(sorted=True)
         t_seq = t_seq.flip(0)  # descending
 
-        x = torch.randn(shape, device=self.device, dtype=self.dtype)
+        x = init_noise if init_noise is not None else torch.randn(shape, device=self.device, dtype=self.dtype)
         for idx, t_val in enumerate(t_seq):
             t = torch.full((shape[0],), int(t_val.item()), device=self.device, dtype=torch.long)
 
