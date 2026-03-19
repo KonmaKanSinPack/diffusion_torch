@@ -58,34 +58,67 @@ from diffusion_torch.fid_utils import compute_fid
 #  数据集
 # ============================================================
 
-def get_dataset(name: str, data_dir: str = './data', batch_size: int = 128):
+def get_dataset(
+    name: str,
+    data_dir: str = './data',
+    batch_size: int = 128,
+    image_size: int = 32,
+):
     """加载数据集, 归一化到 [-1, 1]"""
-    transform_train = T.Compose([
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize([0.5] * 3, [0.5] * 3),
-    ])
-    transform_val = T.Compose([
-        T.ToTensor(),
-        T.Normalize([0.5] * 3, [0.5] * 3),
-    ])
+    need_resize = (name in ('cifar10', 'cifar100') and image_size != 32) or \
+                  name == 'imagenet'
+    resize_ops = [T.Resize((image_size, image_size))] if need_resize else []
+
+    transform_train = T.Compose(
+        resize_ops + [
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ]
+    )
+    transform_val = T.Compose(
+        resize_ops + [
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ]
+    )
 
     if name == 'cifar10':
-        cls = torchvision.datasets.CIFAR10
+        train_set = torchvision.datasets.CIFAR10(
+            data_dir, train=True, download=True, transform=transform_train)
+        val_set = torchvision.datasets.CIFAR10(
+            data_dir, train=False, download=True, transform=transform_val)
     elif name == 'cifar100':
-        cls = torchvision.datasets.CIFAR100
+        train_set = torchvision.datasets.CIFAR100(
+            data_dir, train=True, download=True, transform=transform_train)
+        val_set = torchvision.datasets.CIFAR100(
+            data_dir, train=False, download=True, transform=transform_val)
+    elif name == 'imagenet':
+        train_transform = T.Compose([
+            T.RandomResizedCrop(image_size),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        val_transform = T.Compose([
+            T.Resize(int(image_size * 1.14)),
+            T.CenterCrop(image_size),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        train_set = torchvision.datasets.ImageFolder(
+            os.path.join(data_dir, 'train'), transform=train_transform)
+        val_set = torchvision.datasets.ImageFolder(
+            os.path.join(data_dir, 'val'), transform=val_transform)
     else:
         raise ValueError(f"不支持的数据集: {name}")
-
-    train_set = cls(data_dir, train=True, download=True, transform=transform_train)
-    val_set = cls(data_dir, train=False, download=True, transform=transform_val)
 
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
-        val_set, batch_size=256, shuffle=False,
+        val_set, batch_size=min(256, batch_size * 2), shuffle=False,
         num_workers=4, pin_memory=True,
     )
     return train_loader, val_loader
@@ -215,18 +248,18 @@ def save_samples_vis(
 
 def load_frozen_vqvae(
     ckpt_path: str, device: torch.device, model_size: str = 'small',
+    image_size: int = 32,
 ) -> MultiScaleVQVAE:
     """
     加载训练好的 VQVAE 并冻结全部参数
     
     注意: 使用 EMA 权重 (如果有的话), 因为 EMA 重建质量通常更好
     """
-    if model_size == 'small':
-        vqvae = VQVAE_Small(image_size=32)
-    elif model_size == 'base':
-        vqvae = VQVAE_Base(image_size=32)
-    else:
+    from diffusion_torch.models.vqvae import VQVAE_Large
+    vqvae_factory = {'small': VQVAE_Small, 'base': VQVAE_Base, 'large': VQVAE_Large}
+    if model_size not in vqvae_factory:
         raise ValueError(f"不支持的 VQVAE 规模: {model_size}")
+    vqvae = vqvae_factory[model_size](image_size=image_size)
 
     # 加载 checkpoint
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -325,12 +358,15 @@ def main():
     parser.add_argument('--vqvae_ckpt', type=str, required=True,
                         help='Stage 1 训练好的 VQVAE checkpoint 路径')
     parser.add_argument('--vqvae_size', type=str, default='small',
-                        choices=['small', 'base'])
+                        choices=['small', 'base', 'large'])
 
     # 数据
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100'])
-    parser.add_argument('--data_dir', type=str, default='./data')
+                        choices=['cifar10', 'cifar100', 'imagenet'])
+    parser.add_argument('--data_dir', type=str, default='./data',
+                        help='数据目录 (ImageNet 需含 train/ 和 val/ 子目录)')
+    parser.add_argument('--image_size', type=int, default=32,
+                        help='图像尺寸, 必须与 VQVAE 训练时一致')
 
     # DiT 模型
     parser.add_argument('--dit_size', type=str, default='S',
@@ -389,11 +425,13 @@ def main():
 
     # ---- 加载冻结的 VQVAE ----
     print(f"\n加载 VQVAE ({args.vqvae_size})...")
-    vqvae = load_frozen_vqvae(args.vqvae_ckpt, device, args.vqvae_size)
+    vqvae = load_frozen_vqvae(args.vqvae_ckpt, device, args.vqvae_size, args.image_size)
 
     # ---- 数据集 ----
     print(f"\n加载数据集: {args.dataset}")
-    train_loader, val_loader = get_dataset(args.dataset, args.data_dir, args.batch_size)
+    train_loader, val_loader = get_dataset(
+        args.dataset, args.data_dir, args.batch_size, args.image_size,
+    )
     print(f"  训练集: {len(train_loader.dataset)} 样本")
 
     # ---- Diffusion 配置 ----

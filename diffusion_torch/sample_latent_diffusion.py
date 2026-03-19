@@ -67,14 +67,16 @@ from diffusion_torch.fid_utils import compute_fid, InceptionFeatureExtractor
 #  模型加载
 # ============================================================
 
-def load_vqvae(ckpt_path: str, device: torch.device, model_size: str = 'small') -> MultiScaleVQVAE:
+def load_vqvae(
+    ckpt_path: str, device: torch.device,
+    model_size: str = 'small', image_size: int = 32,
+) -> MultiScaleVQVAE:
     """加载 VQVAE 并冻结"""
-    if model_size == 'small':
-        vqvae = VQVAE_Small(image_size=32)
-    elif model_size == 'base':
-        vqvae = VQVAE_Base(image_size=32)
-    else:
+    from diffusion_torch.models.vqvae import VQVAE_Large
+    vqvae_factory = {'small': VQVAE_Small, 'base': VQVAE_Base, 'large': VQVAE_Large}
+    if model_size not in vqvae_factory:
         raise ValueError(f"不支持: {model_size}")
+    vqvae = vqvae_factory[model_size](image_size=image_size)
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     if 'ema_state_dict' in ckpt:
@@ -312,7 +314,7 @@ def main():
 
     # 模型
     parser.add_argument('--vqvae_ckpt', type=str, required=True)
-    parser.add_argument('--vqvae_size', type=str, default='small', choices=['small', 'base'])
+    parser.add_argument('--vqvae_size', type=str, default='small', choices=['small', 'base', 'large'])
     parser.add_argument('--dit_ckpt', type=str, required=True)
     parser.add_argument('--dit_size', type=str, default='S', choices=['T', 'S', 'B'])
     parser.add_argument('--use_cross_attn', action='store_true', default=True)
@@ -335,8 +337,11 @@ def main():
     parser.add_argument('--pred_type', type=str, default='v')
 
     # 数据 (eval/visualize 模式需要)
-    parser.add_argument('--dataset', type=str, default='cifar10')
+    parser.add_argument('--dataset', type=str, default='cifar10',
+                        choices=['cifar10', 'cifar100', 'imagenet'])
     parser.add_argument('--data_dir', type=str, default='./data')
+    parser.add_argument('--image_size', type=int, default=32,
+                        help='图像尺寸, 必须与训练时一致')
 
     # 输出
     parser.add_argument('--output_dir', type=str, default='./samples')
@@ -351,7 +356,7 @@ def main():
 
     # ---- 加载模型 ----
     print("加载 VQVAE...")
-    vqvae = load_vqvae(args.vqvae_ckpt, device, args.vqvae_size)
+    vqvae = load_vqvae(args.vqvae_ckpt, device, args.vqvae_size, args.image_size)
 
     print(f"加载 DiT-{args.dit_size}...")
     dit = load_dit(args.dit_ckpt, device, args.dit_size, vqvae, args.use_cross_attn)
@@ -399,11 +404,24 @@ def main():
         print(f"\n评估模式: 生成 {args.n_gen} 张并计算 FID/IS...")
 
         # 加载验证集
-        transform = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
-        if args.dataset == 'cifar10':
-            val_set = torchvision.datasets.CIFAR10(args.data_dir, train=False, download=True, transform=transform)
+        if args.dataset == 'imagenet':
+            val_transform = T.Compose([
+                T.Resize(int(args.image_size * 1.14)),
+                T.CenterCrop(args.image_size),
+                T.ToTensor(),
+                T.Normalize([0.5]*3, [0.5]*3),
+            ])
+            val_set = torchvision.datasets.ImageFolder(
+                os.path.join(args.data_dir, 'val'), transform=val_transform)
         else:
-            val_set = torchvision.datasets.CIFAR100(args.data_dir, train=False, download=True, transform=transform)
+            resize_ops = [T.Resize((args.image_size, args.image_size))] \
+                if args.image_size != 32 else []
+            transform = T.Compose(resize_ops + [
+                T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3),
+            ])
+            ds_cls = torchvision.datasets.CIFAR10 if args.dataset == 'cifar10' \
+                else torchvision.datasets.CIFAR100
+            val_set = ds_cls(args.data_dir, train=False, download=True, transform=transform)
         val_loader = DataLoader(val_set, batch_size=256, shuffle=False, num_workers=4)
 
         # 生成
@@ -448,11 +466,24 @@ def main():
         print("\n可视化模式...")
 
         # 加载验证集
-        transform = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
-        if args.dataset == 'cifar10':
-            val_set = torchvision.datasets.CIFAR10(args.data_dir, train=False, download=True, transform=transform)
+        if args.dataset == 'imagenet':
+            val_transform = T.Compose([
+                T.Resize(int(args.image_size * 1.14)),
+                T.CenterCrop(args.image_size),
+                T.ToTensor(),
+                T.Normalize([0.5]*3, [0.5]*3),
+            ])
+            val_set = torchvision.datasets.ImageFolder(
+                os.path.join(args.data_dir, 'val'), transform=val_transform)
         else:
-            val_set = torchvision.datasets.CIFAR100(args.data_dir, train=False, download=True, transform=transform)
+            resize_ops = [T.Resize((args.image_size, args.image_size))] \
+                if args.image_size != 32 else []
+            transform = T.Compose(resize_ops + [
+                T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3),
+            ])
+            ds_cls = torchvision.datasets.CIFAR10 if args.dataset == 'cifar10' \
+                else torchvision.datasets.CIFAR100
+            val_set = ds_cls(args.data_dir, train=False, download=True, transform=transform)
         val_loader = DataLoader(val_set, batch_size=32, shuffle=True, num_workers=4)
 
         # 1. VQVAE 频率分解

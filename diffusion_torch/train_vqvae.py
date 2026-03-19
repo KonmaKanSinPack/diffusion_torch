@@ -52,42 +52,80 @@ from diffusion_torch.ema import EMA, save_checkpoint, load_checkpoint
 #  数据集
 # ============================================================
 
-def get_dataset(name: str, data_dir: str = './data') -> Tuple[DataLoader, DataLoader]:
+def get_dataset(
+    name: str,
+    data_dir: str = './data',
+    image_size: int = 32,
+    batch_size: int = 128,
+) -> Tuple[DataLoader, DataLoader]:
     """
     加载数据集, 图像归一化到 [-1, 1]
     
     Args:
-        name: 'cifar10' 或 'cifar100'
+        name: 'cifar10', 'cifar100', 'imagenet'
         data_dir: 数据存放路径
+        image_size: 目标图像尺寸
+        batch_size: 训练 batch size
     Returns:
         train_loader, val_loader
     """
-    transform_train = T.Compose([
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # → [-1, 1]
-    ])
-    transform_val = T.Compose([
-        T.ToTensor(),
-        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
+    # CIFAR 系列原始 32×32, 若 image_size != 32 则 Resize
+    need_resize = (name in ('cifar10', 'cifar100') and image_size != 32) or \
+                  name == 'imagenet'
+
+    resize_ops = [T.Resize((image_size, image_size))] if need_resize else []
+
+    transform_train = T.Compose(
+        resize_ops + [
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ]
+    )
+    transform_val = T.Compose(
+        resize_ops + [
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ]
+    )
 
     if name == 'cifar10':
-        dataset_cls = torchvision.datasets.CIFAR10
+        train_set = torchvision.datasets.CIFAR10(
+            data_dir, train=True, download=True, transform=transform_train)
+        val_set = torchvision.datasets.CIFAR10(
+            data_dir, train=False, download=True, transform=transform_val)
     elif name == 'cifar100':
-        dataset_cls = torchvision.datasets.CIFAR100
+        train_set = torchvision.datasets.CIFAR100(
+            data_dir, train=True, download=True, transform=transform_train)
+        val_set = torchvision.datasets.CIFAR100(
+            data_dir, train=False, download=True, transform=transform_val)
+    elif name == 'imagenet':
+        # ImageNet: data_dir 应含 train/ 和 val/ 子目录
+        train_transform = T.Compose([
+            T.RandomResizedCrop(image_size),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        val_transform = T.Compose([
+            T.Resize(int(image_size * 1.14)),
+            T.CenterCrop(image_size),
+            T.ToTensor(),
+            T.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        train_set = torchvision.datasets.ImageFolder(
+            os.path.join(data_dir, 'train'), transform=train_transform)
+        val_set = torchvision.datasets.ImageFolder(
+            os.path.join(data_dir, 'val'), transform=val_transform)
     else:
-        raise ValueError(f"不支持的数据集: {name}")
-
-    train_set = dataset_cls(data_dir, train=True, download=True, transform=transform_train)
-    val_set = dataset_cls(data_dir, train=False, download=True, transform=transform_val)
+        raise ValueError(f"不支持的数据集: {name}, 可选: cifar10, cifar100, imagenet")
 
     train_loader = DataLoader(
-        train_set, batch_size=128, shuffle=True,
+        train_set, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
-        val_set, batch_size=256, shuffle=False,
+        val_set, batch_size=min(256, batch_size * 2), shuffle=False,
         num_workers=4, pin_memory=True,
     )
 
@@ -125,6 +163,7 @@ def cosine_lr_schedule(
 @torch.no_grad()
 def evaluate(
     model: nn.Module, val_loader: DataLoader, device: torch.device,
+    image_size: int = 32,
 ) -> dict:
     """
     在验证集上评估 VQVAE 重建质量
@@ -147,7 +186,8 @@ def evaluate(
         total_mse += mse.item()
         total_count += images.shape[0]
 
-    avg_mse = total_mse / (total_count * 3 * 32 * 32)  # 逐像素平均
+    n_pixels = total_count * 3 * image_size * image_size
+    avg_mse = total_mse / n_pixels  # 逐像素平均
     # PSNR: 20 * log10(2 / sqrt(MSE)), 因为值域 [-1,1] 范围为 2
     psnr = 20 * math.log10(2.0 / math.sqrt(avg_mse + 1e-10))
 
@@ -255,19 +295,23 @@ def main():
     
     # 数据
     parser.add_argument('--dataset', type=str, default='cifar10',
-                        choices=['cifar10', 'cifar100'])
-    parser.add_argument('--data_dir', type=str, default='./data')
+                        choices=['cifar10', 'cifar100', 'imagenet'],
+                        help='数据集名称')
+    parser.add_argument('--data_dir', type=str, default='./data',
+                        help='数据目录 (ImageNet 需含 train/ 和 val/ 子目录)')
+    parser.add_argument('--image_size', type=int, default=32,
+                        help='输入图像尺寸 (CIFAR=32, ImageNet 推荐 64/128/256)')
     
     # 模型
     parser.add_argument('--model_size', type=str, default='small',
-                        choices=['small', 'base'],
-                        help='VQVAE 模型规模')
-    parser.add_argument('--hidden_dim', type=int, default=128,
-                        help='Encoder/Decoder 隐藏通道数')
-    parser.add_argument('--latent_dim', type=int, default=32,
-                        help='潜在维度 (每个 code 的维度)')
-    parser.add_argument('--codebook_size', type=int, default=512,
-                        help='每个尺度的 codebook 大小')
+                        choices=['small', 'base', 'large'],
+                        help='VQVAE 模型规模 (large 适合 ImageNet 64+)')
+    parser.add_argument('--hidden_dim', type=int, default=None,
+                        help='Encoder/Decoder 隐藏通道数 (默认随 model_size)')
+    parser.add_argument('--latent_dim', type=int, default=None,
+                        help='潜在维度 (默认随 model_size)')
+    parser.add_argument('--codebook_size', type=int, default=None,
+                        help='每个尺度的 codebook 大小 (默认随 model_size)')
     parser.add_argument('--commitment_weight', type=float, default=0.25,
                         help='commitment loss 权重 β')
     
@@ -299,29 +343,30 @@ def main():
     print(f"设备: {device}")
 
     # ---- 数据集 ----
-    print(f"加载数据集: {args.dataset}")
-    train_loader, val_loader = get_dataset(args.dataset, args.data_dir)
-    # 更新 batch_size
-    train_loader = DataLoader(
-        train_loader.dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True,
+    print(f"加载数据集: {args.dataset} (image_size={args.image_size})")
+    train_loader, val_loader = get_dataset(
+        args.dataset, args.data_dir, args.image_size, args.batch_size,
     )
     print(f"  训练集: {len(train_loader.dataset)} 样本")
     print(f"  验证集: {len(val_loader.dataset)} 样本")
 
     # ---- 模型 ----
-    if args.model_size == 'small':
-        model = VQVAE_Small(
-            image_size=32,
-            commitment_weight=args.commitment_weight,
-        )
-    elif args.model_size == 'base':
-        model = VQVAE_Base(
-            image_size=32,
-            commitment_weight=args.commitment_weight,
-        )
-    else:
-        raise ValueError(f"不支持的模型规模: {args.model_size}")
+    from diffusion_torch.models.vqvae import VQVAE_Large
+    vqvae_factory = {'small': VQVAE_Small, 'base': VQVAE_Base, 'large': VQVAE_Large}
+
+    # 收集非 None 的模型参数作为 kwargs 传入工厂函数 (覆盖工厂默认值)
+    model_kwargs = {'commitment_weight': args.commitment_weight}
+    if args.hidden_dim is not None:
+        model_kwargs['hidden_dim'] = args.hidden_dim
+    if args.latent_dim is not None:
+        model_kwargs['latent_dim'] = args.latent_dim
+    if args.codebook_size is not None:
+        model_kwargs['codebook_size'] = args.codebook_size
+
+    model = vqvae_factory[args.model_size](
+        image_size=args.image_size,
+        **model_kwargs,
+    )
 
     model = model.to(device)
 
@@ -385,7 +430,7 @@ def main():
         if (epoch + 1) % args.vis_interval == 0:
             # 使用 EMA 模型评估
             ema.apply_shadow(model)
-            eval_result = evaluate(model, val_loader, device)
+            eval_result = evaluate(model, val_loader, device, args.image_size)
             print(
                 f"  [验证] MSE={eval_result['mse']:.6f}  "
                 f"PSNR={eval_result['psnr']:.2f}dB  "

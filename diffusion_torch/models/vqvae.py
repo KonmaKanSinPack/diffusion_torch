@@ -719,7 +719,7 @@ class FrequencyDecomposer:
 
 def VQVAE_Small(image_size: int = 32, **kwargs) -> MultiScaleVQVAE:
     """小型 VQVAE (约 5M 参数, 适合 CIFAR-10)"""
-    cfg = VQVAEConfig(
+    defaults = dict(
         image_size=image_size,
         hidden_dim=128,
         latent_dim=32,
@@ -727,14 +727,15 @@ def VQVAE_Small(image_size: int = 32, **kwargs) -> MultiScaleVQVAE:
         ch_mult=[1, 2, 4],
         multi_scales=[1, 2, 4, 8],
         codebook_size=512,
-        **kwargs,
     )
+    defaults.update(kwargs)
+    cfg = VQVAEConfig(**defaults)
     return MultiScaleVQVAE(cfg)
 
 
 def VQVAE_Base(image_size: int = 32, **kwargs) -> MultiScaleVQVAE:
     """基础 VQVAE (约 14M 参数)"""
-    cfg = VQVAEConfig(
+    defaults = dict(
         image_size=image_size,
         hidden_dim=256,
         latent_dim=32,
@@ -742,14 +743,15 @@ def VQVAE_Base(image_size: int = 32, **kwargs) -> MultiScaleVQVAE:
         ch_mult=[1, 2, 4],
         multi_scales=[1, 2, 4, 8],
         codebook_size=1024,
-        **kwargs,
     )
+    defaults.update(kwargs)
+    cfg = VQVAEConfig(**defaults)
     return MultiScaleVQVAE(cfg)
 
 
 def VQVAE_Large(image_size: int = 64, **kwargs) -> MultiScaleVQVAE:
     """大型 VQVAE (约 45M 参数, 适合 CelebA-HQ/LSUN)"""
-    cfg = VQVAEConfig(
+    defaults = dict(
         image_size=image_size,
         hidden_dim=256,
         latent_dim=64,
@@ -757,6 +759,7 @@ def VQVAE_Large(image_size: int = 64, **kwargs) -> MultiScaleVQVAE:
         ch_mult=[1, 2, 4, 8],
         multi_scales=[1, 2, 4, 8, 16],
         codebook_size=2048,
-        **kwargs,
     )
+    defaults.update(kwargs)
+    cfg = VQVAEConfig(**defaults)
     return MultiScaleVQVAE(cfg)
