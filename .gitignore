@@ -2,7 +2,7 @@
 diffusion_torch/temp-*.py
 diffusion_torch/data/
 diffusion_torch/checkpoints/
-
+diffusion_torch/outputs/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
