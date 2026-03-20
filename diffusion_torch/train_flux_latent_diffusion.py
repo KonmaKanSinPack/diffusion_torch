@@ -403,10 +403,9 @@ def train_epoch(
     device: torch.device,
     ema: EMA,
     grad_accum_steps: int = 1,
-    scaler: Optional[torch.amp.GradScaler] = None,
     use_amp: bool = False,
 ) -> dict:
-    """单个 epoch 训练 (支持 AMP 混合精度)"""
+    """单个 epoch 训练 (支持 bf16 AMP 混合精度)"""
     dit_model.train()
     total_loss = 0.0
     total_main = 0.0
@@ -421,20 +420,11 @@ def train_epoch(
             loss, log_dict = diffusion.training_loss(dit_model, z_0, context=None)
             loss = loss / grad_accum_steps
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        loss.backward()
 
         if (step + 1) % grad_accum_steps == 0:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
-                optimizer.step()
+            torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
+            optimizer.step()
             optimizer.zero_grad()
             ema.update(dit_model)
 
@@ -444,14 +434,8 @@ def train_epoch(
         n_batches += 1
 
     if n_batches % grad_accum_steps != 0:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
-            optimizer.step()
+        torch.nn.utils.clip_grad_norm_(dit_model.parameters(), max_norm=1.0)
+        optimizer.step()
         optimizer.zero_grad()
         ema.update(dit_model)
 
@@ -643,9 +627,9 @@ def main():
     ema = EMA(dit_model, decay=args.ema_decay)
 
     # ---- AMP & Compile ----
-    scaler = None
+    # bf16 有与 fp32 相同的指数位数 (8 bit), 不需要 GradScaler
+    # GradScaler 仅适用于 fp16 (5 bit 指数, 容易溢出)
     if args.use_amp:
-        scaler = torch.amp.GradScaler('cuda')
         print(f"  [AMP] bf16 混合精度已启用")
     if args.compile:
         dit_model = torch.compile(dit_model)
@@ -691,7 +675,7 @@ def main():
         log = train_epoch(
             dit_model, diffusion, train_loader, optimizer,
             device, ema, grad_accum_steps=args.grad_accum,
-            scaler=scaler, use_amp=args.use_amp,
+            use_amp=args.use_amp,
         )
         t_elapsed = time.time() - t0
 
