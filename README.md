@@ -1,711 +1,444 @@
-# SpectralDiff V2 — 多尺度 VQVAE + 潜空间频谱扩散模型
+# FLUX VAE + DiT 潜空间扩散模型
 
 ## 一、项目概述
 
-**SpectralDiff V2** 是一个基于 **VAR (Visual Autoregressive)** 思想的两阶段图像生成模型：
+本项目使用 **FLUX.1-dev 预训练 VAE** 作为图像编解码器，在其潜在空间上训练 **DiT (Diffusion Transformer)** 扩散模型，实现无条件图像生成。
 
-- **Stage 1**: 训练多尺度 VQVAE，将图像压缩为离散潜码
-- **Stage 2**: 在 VQVAE 潜空间中训练 DiT 扩散模型，用 SVD 频域辅助损失引导
+**核心思路：** 利用强大的预训练 VAE 跳过自训练编码器步骤，直接在高质量潜在空间中学习数据分布。
 
-:::::
-> **粗尺度** (1×1, 2×2) 自然捕获 **低频信息** (轮廓、外观) = SVD 的角色
-> **细尺度** (4×4, 8×8) 捕获 **高频信息** (纹理、光照) = Diffusion 的角色
+**流程简图：**
 
-reset: **CIFAR-10**, **CIFAR-100**, **ImageNet**
+```
+输入图像 x ∈ [B, 3, 256, 256]
+    │
+    ▼ FLUX VAE Encoder (冻结)
+    │
+    z_raw = Encoder(x).sample()              # [B, 16, 32, 32]
+    z_scaled = (z_raw - shift) × scale       # FLUX 内置 scale/shift
+    z_norm = (z_scaled - μ_ch) / σ_ch        # 逐通道归一化 → ~N(0,1)
+    │
+    ▼ DiT 扩散训练 (在 z_norm 空间)
+    │
+    采样: z_t → DiT → z_0_norm (DDIM, 50步)
+    │
+    ▼ 反归一化 + FLUX VAE Decoder
+    │
+    z_0_scaled = z_0_norm × σ_ch + μ_ch      # 反归一化
+    z_0_raw = z_0_scaled / scale + shift      # 反 scale/shift
+    x_gen = Decoder(z_0_raw)                  # [B, 3, 256, 256]
+```
+
+**支持数据集：**
+- `cifar10` / `cifar100` — 32×32 小图，自动上采样到 `image_size` 编码
+- `imagenet` — ImageNet-1k 256×256 (via HuggingFace `evanarlian/imagenet_1k_resized_256`)
+- `imagefolder` — 本地 ImageFolder 格式 (需含 `train/` 和 `val/` 子目录)
 
 ---
 
 ## 二、环境要求
 
-```
-Python >= 3.8
-PyTorch >= 2.0
-torchvision
-numpy
+### 硬件
+- GPU: 建议 ≥ 16GB 显存 (RTX 4090 / A100 / B300 等)
+- 磁盘: CIFAR ~2GB, ImageNet ~30GB (HuggingFace 缓存)
+
+### 软件依赖
+
+```bash
+pip install torch torchvision numpy diffusers transformers datasets huggingface_hub
 ```
 
-#reset 
-:
-```bash
-pip install torch torchvision numpy
-```
+核心依赖：
+| 包 | 最低版本 | 用途 |
+|---|---------|------|
+| `torch` | ≥ 2.0 | 训练框架 |
+| `torchvision` | ≥ 0.15 | 数据加载、Inception-V3 |
+| `diffusers` | ≥ 0.25 | FLUX.1-dev VAE (`AutoencoderKL`) |
+| `datasets` | ≥ 2.0 | HuggingFace ImageNet 加载 |
+| `numpy` | ≥ 1.20 | FID 计算 |
 
 ---
 
 ## 三、架构设计
 
-### 3.1 总体流程
+### 3.1 FLUX.1-dev VAE
 
-```
- x ∈ [B, 3, H, H]
-    │
-    ▼
+使用 `black-forest-labs/FLUX.1-dev` 的预训练 `AutoencoderKL`：
 
-  Multi-Scale VQVAE           │
-  Encoder → 下采样            │
-  → MultiScaleQuantizer       │
-    (scales=[1,2,4,8,...])    │
-  → 潜码 z ∈ [B, D, H', H'] │
+| 参数 | 值 | 说明 |
+|------|---|------|
+| `latent_channels` | 16 | 潜在通道数 (比 SD 的 4 通道更丰富) |
+| 空间下采样 | 8× | 256×256 → 32×32 |
+| `scaling_factor` | 0.3611 | 内置 latent 缩放因子 |
+| `shift_factor` | 0.1159 | 内置 latent 偏移因子 |
+| 参数量 | ~168M | 完全冻结，不参与训练 |
 
-    │           │
-    │ z0        │ 多尺度上下文 ctx
-    ▼           ▼
+**编码公式：**
+$$z_{\text{scaled}} = (z_{\text{raw}} - \text{shift}) \times \text{scale}$$
 
-  Latent DiT                  │
-  + SVD 频域辅助损失           │
-  + 多尺度交叉注意力 (VAR)    │
-  v-prediction / min-SNR-γ   │
+**解码公式：**
+$$z_{\text{raw}} = z_{\text{scaled}} / \text{scale} + \text{shift}$$
 
-    │
-    ▼
+### 3.2 逐通道归一化
 
-  VQVAE Decoder               │
-  潜码 → 重建图像              │
+FLUX VAE 输出的 latent 各通道统计量差异较大 (均值范围 -1.08 ~ +1.70，标准差 ~1.37)。扩散模型假设数据近似标准正态分布，所以需要逐通道归一化：
 
-```
+$$z_{\text{norm}}^{(c)} = \frac{z_{\text{scaled}}^{(c)} - \mu_c}{\sigma_c}$$
 
-### 3.2 多尺度 VQVAE (参考 VAR)
+其中 $\mu_c, \sigma_c$ 在整个训练集上统计。归一化后每通道 ~ $\mathcal{N}(0, 1)$。
 
- z 按不同尺度做自适应池化，每个尺度独立向量量化（残差式），量化结果上采样累加:
+生成时需要反归一化：$z_{\text{scaled}}^{(c)} = z_{\text{norm}}^{(c)} \times \sigma_c + \mu_c$
 
-```
-z ∈ [B, D, H', W']
-  ├─ AdaptiveAvgPool → 1×1 → VQ → 上采样 → z_hat_1   (最粗: 全局结构)
-  ├─ AdaptiveAvgPool → 2×2 → VQ(残差) → 上采样 → z_hat_2
-  ├─ AdaptiveAvgPool → 4×4 → VQ(残差) → 上采样 → z_hat_4
-  └─ 无池化 → 8×8 → VQ(残差) → z_hat_8              (最细: 纹理细节)
-  → z_hat = z_hat_1 + z_hat_2 + z_hat_4 + z_hat_8
-```
+> 通道统计量 ($\mu_c, \sigma_c$) 保存在每个 checkpoint 中，确保推理复现。
 
-:
-- EMA 编码本更新 (不走梯度, Laplace 平滑防止坍缩)
-- 直通估计器 (Straight-Through Estimator) 传递梯度
-- 每个尺度独立 codebook
+### 3.3 DiT (Diffusion Transformer)
 
-### 3.3 Latent DiT + 交叉注意力
+DiT 在归一化后的潜在空间中运行：
 
-DiT 在 VQVAE 潜空间中运行，通过 **多尺度交叉注意力** 接收 VQVAE 粗尺度条件:
+| 配置 | 层数 | 头数 | 隐藏维度 | 参数量 | 适用场景 |
+|------|------|------|---------|--------|---------|
+| DiT-T (Tiny) | 6 | 3 | 192 | ~5M | 快速实验 |
+| DiT-S (Small) | 12 | 6 | 384 | ~33M | CIFAR-10 |
+| DiT-B (Base) | 12 | 12 | 768 | ~130M | ImageNet |
 
-- Q ← DiT 隐状态 (潜码 tokens)
-- K, V ← 多尺度上下文 (VQVAE 各尺度量化结果展平拼接)
-- 每隔 2 个 DiTBlock 加一层交叉注意力
-- 零初始化门控 (cross_gate) 保证初始不破坏训练
-- QK-Norm 防止注意力发散
+**关键设计：**
+- **Patch Embedding**: 将 32×32×16 latent 分割为 16×16 = 256 个 token (patch_size=2)
+- **adaLN-Zero**: 时间步嵌入通过 Adaptive LayerNorm 调制每层参数
+- **Zero-Init 输出层**: 初始化时每个 DiT 块 ≈ 恒等映射
+- **QK-Norm**: 防止注意力权重发散
+- **2D 正弦位置编码**: patch 级绝对位置信息
 
-### 3.4 损失函数
+> 本项目不使用 cross-attention (FLUX VAE 无多尺度量化输出)。
 
-```
-L_total = w_snr(t) · L_main + λ_svd · L_svd
+### 3.4 扩散过程
 
---------:
-  L_main = MSE(v_pred, v_target)       (v-prediction)
-  w_snr(t) = min(SNR(t), γ) / SNR(t)  (min-SNR-γ 加权)
-  L_svd = ||P_L(ẑ₀ - z₀)||² + ||(I-P_L)(ẑ₀ - z₀)||²  (SVD 投影误差)
-  P_L = U_k · U_k^T                    (前 k 个奇异向量投影)
-```
-
-### 3.5 采样方法
-
-| 方法 | 步数 | 特点 |
+| 组件 | 选择 | 说明 |
 |------|------|------|
-| DDIM | 50-250 | 快速, 确定性 |
-| DDPM | 1000 | 完整马尔可夫链, 最佳质量 |
-| 多尺度级联 (Cascade) | 50-250 | 先去噪70%取低频 → SVD截断 → 重加噪继续精修 |
+| 噪声调度 | Cosine | $\bar{\alpha}(t) = \cos^2(\frac{\pi}{2} \cdot \frac{t/T + s}{1+s})$, $s=0.008$ |
+| 预测目标 | v-prediction | $v = \sqrt{\bar{\alpha}_t} \cdot \epsilon - \sqrt{1-\bar{\alpha}_t} \cdot x_0$, 高 SNR 端更稳定 |
+| 损失加权 | min-SNR-$\gamma$ | $w(t) = \min(\text{SNR}(t), \gamma) / \text{SNR}(t)$, $\gamma=5.0$ |
+| 采样方法 | DDIM | 确定性采样，默认 50 步 |
+| 时间步数 | 1000 | 训练时均匀采样 |
+
+**训练损失：**
+$$\mathcal{L} = w_{\text{SNR}}(t) \cdot \|v_\theta(z_t, t) - v_{\text{target}}\|^2$$
+
+### 3.5 训练优化
+
+| 优化器 | 设置 |
+|--------|------|
+| AdamW | lr=2e-4, weight_decay=0.01, betas=(0.9, 0.99) |
+| LR Schedule | Cosine annealing + 20-epoch linear warmup |
+| EMA | decay=0.9999, 评估时使用 EMA 权重 |
+| AMP | bf16 混合精度 (默认开启) |
+| Grad Clip | max_norm=1.0 |
 
 ---
 
-## 四、模型规模
+## 四、训练指南
 
-### VQVAE
-
-| 配置 | 推荐场景 | hidden_dim | latent_dim | ch_mult | 编码本 | 多尺度 |
-|------|---------|-----------|-----------|---------|--------|--------|
-| `small` | CIFAR (32×32) | 128 | 32 | [1,2,4] | 512 | [1,2,4,8] |
-| `base` | CIFAR/ImageNet-64 | 256 | 32 | [1,2,4] | 1024 | [1,2,4,8] |
-| `large` | ImageNet (64-256) | 256 | 64 | [1,2,4,8] | 2048 | [1,2,4,8,16] |
-
-### DiT
-
-| 配置 | 参数量 | 层数 | 头数 | 隐藏维度 | 交叉注意力层 |
-|------|--------|------|------|---------|------------|
-| `T` (Tiny) | ~4.7M | 6 | 6 | 192 | 3 |
-| `S` (Small) | ~16M | 12 | 6 | 384 | 6 |
-| `B` (Base) | ~59M | 12 | 12 | 768 | 6 |
-
----
-
-## 五、数据集准备
-
-### CIFAR-10 / CIFAR-100
-
-pip install h5py :
-```bash
-# 自动下载到 ./data 目录
-python3 train_vqvae.py --dataset cifar10 --data_dir ./data
-```
-
-### ImageNet
-
-:
-```
-/path/to/imagenet/
- train/
-   ├── n01440764/
-   │   ├── n01440764_10026.JPEG
-   │   └── ...
-   ├── n01443537/
-   └── ... (共 1000 个类别)
- val/
-    ├── n01440764/
-    └── ... (共 1000 个类别)
-```
-
----
-
-## 六、训练指南
-
-### Stage 1: 训练 VQVAE
-
-#### CIFAR-10 (32×32)
+### 4.1 CIFAR-10
 
 ```bash
 cd diffusion_torch/diffusion_torch
 
-python3 train_vqvae.py \
+python3 train_flux_latent_diffusion.py \
     --dataset cifar10 \
     --data_dir ./data \
-    --image_size 32 \
-    --model_size small \
-    --codebook_size 512 \
-    --latent_dim 32 \
-    --commitment_weight 0.25 \
-    --epochs 200 \
-    --batch_size 128 \
-    --lr 1e-3 \
-    --ema_decay 0.999 \
-    --vis_interval 10 \
-    --save_interval 20 \
-    --output_dir ./checkpoints/vqvae_cifar10
-```
-
-#### ImageNet 64×64
-
-```bash
-python3 train_vqvae.py \
-    --dataset imagenet \
-    --data_dir /path/to/imagenet \
-    --image_size 64 \
-    --model_size large \
-    --codebook_size 2048 \
-    --latent_dim 64 \
-    --commitment_weight 0.25 \
-    --epochs 100 \
-    --batch_size 64 \
-    --lr 1e-3 \
-    --ema_decay 0.999 \
-    --vis_interval 5 \
-    --save_interval 10 \
-    --output_dir ./checkpoints/vqvae_imagenet64
-```
-
-#### ImageNet 256×256
-
-```bash
-python3 train_vqvae.py \
-    --dataset imagenet \
-    --data_dir /path/to/imagenet \
     --image_size 256 \
-    --model_size large \
-    --codebook_size 2048 \
-    --latent_dim 64 \
-    --commitment_weight 0.25 \
-    --epochs 100 \
-    --batch_size 16 \
-    --lr 5e-4 \
-    --ema_decay 0.999 \
-    --vis_interval 5 \
-    --save_interval 10 \
-    --output_dir ./checkpoints/vqvae_imagenet256
-```
-
-**关键监控指标:**
-- `PSNR`: ≥ 25dB 表示重建质量可接受 (CIFAR), ≥ 22dB (ImageNet)
-- `Codebook使用率`: ≥ 80% (低于此值说明 codebook 坍缩)
-- `loss_recon`: 应持续下降
-- `loss_commit`: 应保持稳定在 0.1-1.0 范围
-
-**输出文件:**
-```
-checkpoints/vqvae_cifar10/
- best.pt          # 最佳 PSNR 的 checkpoint (含 EMA 权重)
- final.pt         # 最终 epoch 的 checkpoint
- epoch0020.pt     # 定期保存的 checkpoint
- vis/
-    ├── recon_epoch0010.png  # 重建可视化
-    └── ...
-```
-
----
-
-### Stage 2: 训练潜空间扩散
-
-#### CIFAR-10
-
-```bash
-python3 train_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dataset cifar10 \
-    --data_dir ./data \
-    --image_size 32 \
-    --dit_size S \
-    --pred_type v \
-    --beta_schedule cosine \
-    --num_timesteps 1000 \
-    --min_snr_gamma 5.0 \
-    --svd_aux_weight 0.1 \
-    --use_svd_aux \
-    --use_multiscale_cond \
-    --cond_scales 1 2 \
+    --dit_size B \
     --epochs 500 \
-    --batch_size 128 \
-    --lr 1e-4 \
-    --ema_decay 0.9999 \
-    --ddim_steps 50 \
-    --fid_interval 50 \
-    --fid_n_samples 5000 \
-    --vis_interval 10 \
-    --save_interval 50 \
-    --output_dir ./checkpoints/latent_diff_cifar10
+    --batch_size 256 \
+    --lr 2e-4 \
+    --warmup_epochs 20 \
+    --fid_interval 25 \
+    --vis_interval 5 \
+    --output_dir ./checkpoints/flux_latent_diffusion
 ```
 
-#### ImageNet 64×64
+> CIFAR-10 的 32×32 图像会被上采样到 256×256 送入 FLUX VAE。FID 在原始 32×32 分辨率下计算。
+
+### 4.2 ImageNet 256×256
 
 ```bash
-python3 train_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_imagenet64/best.pt \
-    --vqvae_size large \
-    --dataset imagenet \
-    --data_dir /path/to/imagenet \
-    --image_size 64 \
-    --dit_size B \
-    --pred_type v \
-    --beta_schedule cosine \
-    --num_timesteps 1000 \
-    --min_snr_gamma 5.0 \
-    --svd_aux_weight 0.1 \
-    --use_svd_aux \
-    --use_multiscale_cond \
-    --cond_scales 1 2 \
-    --epochs 300 \
-    --batch_size 64 \
-    --lr 1e-4 \
-    --ema_decay 0.9999 \
-    --ddim_steps 50 \
-    --fid_interval 50 \
-    --fid_n_samples 5000 \
-    --vis_interval 10 \
-    --save_interval 50 \
-    --output_dir ./checkpoints/latent_diff_imagenet64
-```
+cd diffusion_torch/diffusion_torch
 
-#### ImageNet 256×256
-
-```bash
-python3 train_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_imagenet256/best.pt \
-    --vqvae_size large \
+python3 train_flux_latent_diffusion.py \
     --dataset imagenet \
-    --data_dir /path/to/imagenet \
+    --data_dir ./data \
     --image_size 256 \
     --dit_size B \
-    --pred_type v \
-    --beta_schedule cosine \
-    --num_timesteps 1000 \
-    --min_snr_gamma 5.0 \
-    --svd_aux_weight 0.1 \
-    --use_svd_aux \
-    --use_multiscale_cond \
-    --cond_scales 1 2 \
-    --epochs 300 \
-    --batch_size 8 \
-    --lr 5e-5 \
-    --ema_decay 0.9999 \
-    --ddim_steps 50 \
-    --fid_interval 100 \
-    --fid_n_samples 5000 \
-    --vis_interval 10 \
-    --save_interval 50 \
-    --output_dir ./checkpoints/latent_diff_imagenet256
-```
-
-**关键参数说明:**
-| 参数 | 作用 | 推荐值 |
-|------|------|--------|
-| `--pred_type v` | v-prediction, 高 SNR 端更稳定 | `v` (推荐) 或 `eps` |
-| `--beta_schedule cosine` | 更均匀的信噪比分布 | `cosine` |
-| `--min_snr_gamma 5.0` | 平衡不同噪声水平的训练信号 | 5.0 |
-| `--svd_aux_weight 0.1` | SVD 辅助损失权重 | 0.05-0.2 |
-| `--cond_scales 1 2` | 用粗尺度 (1×1, 2×2) 做条件 | [1, 2] |
-| `--use_multiscale_cond` | 开启 VAR 风格多尺度条件 | 默认开启 |
-| `--no_svd_aux` | 关闭 SVD 辅助损失 | 调试时可用 |
-| `--no_multiscale_cond` | 关闭多尺度条件 (无条件生成) | 消融实验 |
-
-**输出文件:**
-```
-checkpoints/latent_diff_cifar10/
- best.pt          # 最佳 FID 的 checkpoint
- final.pt         # 最终 checkpoint
- epoch0050.pt     # 定期保存
- vis/
-    ├── samples_epoch0010.png  # DDIM 采样可视化
-    └── ...
-```
-
-**注意:** Stage 2 的 `--image_size` 和 `--vqvae_size` 必须与 Stage 1 训练时一致。
-
----
-
-## 七、推理 (采样) 指南
-
-### 7.1 DDIM 采样 (快速, 推荐)
-
-```bash
-# CIFAR-10
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dit_ckpt ./checkpoints/latent_diff_cifar10/best.pt \
-    --dit_size S \
-    --image_size 32 \
-    --mode ddim \
-    --ddim_steps 50 \
-    --n_samples 64 \
+    --epochs 100 \
     --batch_size 64 \
-    --output_dir ./samples/cifar10_ddim
-
-# ImageNet 64×64
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_imagenet64/best.pt \
-    --vqvae_size large \
-    --dit_ckpt ./checkpoints/latent_diff_imagenet64/best.pt \
-    --dit_size B \
-    --image_size 64 \
-    --mode ddim \
-    --ddim_steps 100 \
-    --n_samples 64 \
-    --output_dir ./samples/imagenet64_ddim
+    --lr 2e-4 \
+    --warmup_epochs 10 \
+    --fid_interval 10 \
+    --fid_n_samples 2048 \
+    --vis_interval 5 \
+    --save_interval 10 \
+    --output_dir ./checkpoints/flux_imagenet
 ```
 
-### 7.2 多尺度级联采样
+> 首次运行时会自动从 HuggingFace 下载 `evanarlian/imagenet_1k_resized_256` (~25GB)，缓存到 `--data_dir/imagenet_hf_cache/`。
+> 1.28M 训练图像的 latent 预计算约需 30-60 分钟，自动缓存到 `--latent_cache_dir`。
+
+### 4.3 ImageNet 快速实验
+
+使用 `--max_train_samples` 限制训练集大小，快速验证流程：
 
 ```bash
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dit_ckpt ./checkpoints/latent_diff_cifar10/best.pt \
-    --dit_size S \
-    --image_size 32 \
-    --mode cascade \
-    --ddim_steps 50 \
-    --n_samples 64 \
-    --output_dir ./samples/cifar10_cascade
-```
-
-:
-```
-Phase A: 噪声 → DDIM 去噪 70% → 得到粗糙 z₀
-         ↓
-    SVD 截断: z₀ → 保留前 k 奇异值 → z_low (低频结构)
-         ↓
-Phase B: z_low → 重新加噪到 t_mid → DDIM 继续去噪到 t=0 → z_final
-         ↓
-    VQVAE Decode → 输出图像
-```
-
-### 7.3 DDPM 完整采样
-
-```bash
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dit_ckpt ./checkpoints/latent_diff_cifar10/best.pt \
-    --dit_size S \
-    --image_size 32 \
-    --mode ddpm \
-    --n_samples 16 \
-    --output_dir ./samples/cifar10_ddpm
-```
-
-**采样输出:**
-```
-samples/cifar10_ddim/
- ddim_samples.png       # 网格可视化 (最多 64 张)
- ddim_images/
-    ├── 00000.png          # 单张图像
-    ├── 00001.png
-    └── ...
-```
-
----
-
-## 八、测评指南
-
-### 8.1 FID + IS 评估
-
-```bash
-# CIFAR-10 FID-10k + IS
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dit_ckpt ./checkpoints/latent_diff_cifar10/best.pt \
-    --dit_size S \
-    --image_size 32 \
-    --dataset cifar10 \
-    --data_dir ./data \
-    --mode eval \
-    --n_gen 10000 \
-    --ddim_steps 250 \
-    --batch_size 64 \
-    --output_dir ./eval/cifar10
-
-# ImageNet 64×64 FID-50k
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_imagenet64/best.pt \
-    --vqvae_size large \
-    --dit_ckpt ./checkpoints/latent_diff_imagenet64/best.pt \
-    --dit_size B \
-    --image_size 64 \
+python3 train_flux_latent_diffusion.py \
     --dataset imagenet \
-    --data_dir /path/to/imagenet \
-    --mode eval \
-    --n_gen 50000 \
-    --ddim_steps 250 \
-    --batch_size 64 \
-    --output_dir ./eval/imagenet64
+    --data_dir ./data \
+    --image_size 256 \
+    --dit_size B \
+    --max_train_samples 50000 \
+    --epochs 50 \
+    --batch_size 128 \
+    --lr 2e-4 \
+    --fid_interval 10 \
+    --output_dir ./checkpoints/flux_imagenet_50k
 ```
 
-**评估输出:**
-```
-eval/cifar10/
- eval_results.txt   # FID, IS 数值
- eval_samples.png   # 样本可视化
-```
-
-`eval_results.txt` 内容:
-```
-FID: 12.3456
-IS: 8.5432 ± 0.2345
-n_gen: 10000
-ddim_steps: 250
-```
-
-### 8.2 可视化 (频率分解 + 采样对比)
+### 4.4 本地 ImageFolder
 
 ```bash
-# CIFAR-10
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_cifar10/best.pt \
-    --vqvae_size small \
-    --dit_ckpt ./checkpoints/latent_diff_cifar10/best.pt \
-    --dit_size S \
-    --image_size 32 \
-    --dataset cifar10 \
-    --data_dir ./data \
-    --mode visualize \
-    --ddim_steps 50 \
-    --output_dir ./vis/cifar10
-
-# ImageNet 64×64
-python3 sample_latent_diffusion.py \
-    --vqvae_ckpt ./checkpoints/vqvae_imagenet64/best.pt \
-    --vqvae_size large \
-    --dit_ckpt ./checkpoints/latent_diff_imagenet64/best.pt \
+python3 train_flux_latent_diffusion.py \
+    --dataset imagefolder \
+    --data_dir /path/to/your/dataset \
+    --image_size 256 \
     --dit_size B \
-    --image_size 64 \
-    --dataset imagenet \
-    --data_dir /path/to/imagenet \
-    --mode visualize \
-    --ddim_steps 50 \
-    --output_dir ./vis/imagenet64
+    --epochs 200 \
+    --batch_size 64 \
+    --output_dir ./checkpoints/flux_custom
 ```
 
-**可视化输出:**
+目录结构需为：
 ```
-vis/cifar10/
- freq_decomposition.png  # 多尺度频率分解
-   行1: 原图
-   行2: 完整重建
-   行3: 低频 (scale 1+2)
-   行4: 中频 (scale 4)
-   行5: 高频 (scale 8)
-   行6+: 各尺度独立重建
- ddim_vs_cascade.png     # DDIM vs 级联采样对比
-    行1: DDIM 样本
-    行2: 级联采样样本
+/path/to/your/dataset/
+  train/
+    class_a/
+      img001.jpg
+      ...
+    class_b/
+      ...
+  val/
+    class_a/
+      ...
+```
+
+### 4.5 恢复训练
+
+```bash
+python3 train_flux_latent_diffusion.py \
+    --dataset imagenet \
+    --data_dir ./data \
+    --resume ./checkpoints/flux_imagenet/epoch0050.pt \
+    --epochs 100 \
+    --output_dir ./checkpoints/flux_imagenet
 ```
 
 ---
 
-## 九、完整参数参考
+## 五、训练流程详解
 
-### train_vqvae.py
+完整训练流程如下：
+
+### Step 1: 加载 FLUX VAE
+
+```python
+FluxVAEWrapper(device, dtype=torch.float32)
+# 从 HuggingFace 加载 black-forest-labs/FLUX.1-dev 的 vae 子模块
+# 完全冻结, requires_grad=False
+```
+
+### Step 2: 预计算 Latent
+
+```python
+precompute_latents(flux_vae, train_set, batch_size=64, cache_path=...)
+# 遍历整个训练集, 通过 FLUX VAE encoder 得到 latent
+# 缓存到磁盘 (.pt 文件), 后续 epoch 直接加载
+```
+
+输出形状: `(N, 16, 32, 32)` float32
+
+### Step 3: 逐通道归一化
+
+```python
+normalize_latents(train_latents)
+# 计算每通道 μ_c, σ_c
+# 归一化: z_norm = (z - μ_c) / σ_c
+# 返回 (归一化 latent, channel_mean, channel_std)
+```
+
+### Step 4: 训练 DiT
+
+每个 epoch：
+1. 从归一化 latent cache 采样 mini-batch $z_0$
+2. 均匀采样 $t \sim U\{1, T\}$
+3. 加噪: $z_t = \sqrt{\bar\alpha_t} \cdot z_0 + \sqrt{1-\bar\alpha_t} \cdot \epsilon$
+4. DiT 预测: $\hat{v} = \text{DiT}(z_t, t)$
+5. 计算 min-SNR-$\gamma$ 加权 MSE 损失
+6. 梯度更新 + EMA 更新
+
+### Step 5: 评估与采样
+
+- **可视化**: 每 `vis_interval` epoch 用 EMA 权重 DDIM 采样 64 张图
+- **FID**: 每 `fid_interval` epoch 生成 `fid_n_samples` 张图与验证集比较
+  - CIFAR: 生成 256×256 → 下采样 32×32 → Inception 特征
+  - ImageNet: 生成 256×256 → 直接送 Inception 特征
+
+---
+
+## 六、完整参数参考
+
+### train_flux_latent_diffusion.py
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--dataset` | str | cifar10 | 数据集: cifar10, cifar100, imagenet |
-| `--data_dir` | str | ./data | 数据目录 (ImageNet 需含 train/ 和 val/) |
-| `--image_size` | int | 32 | 图像尺寸 (CIFAR=32, ImageNet=64/128/256) |
-| `--model_size` | str | small | VQVAE 规模: small, base, large |
-| `--hidden_dim` | int | 随model_size | Encoder/Decoder 隐藏通道数 (覆盖工厂默认) |
-| `--latent_dim` | int | 随model_size | 潜在维度 (覆盖工厂默认) |
-| `--codebook_size` | int | 随model_size | 每个尺度的 codebook 大小 (覆盖工厂默认) |
-| `--commitment_weight` | float | 0.25 | commitment loss 权重 |
-| `--epochs` | int | 100 | 训练轮数 |
-| `--batch_size` | int | 128 | 批大小 |
-| `--lr` | float | 1e-3 | 初始学习率 |
-| `--min_lr` | float | 1e-5 | 最小学习率 |
-| `--warmup_epochs` | int | 5 | warmup 轮数 |
-| `--ema_decay` | float | 0.999 | EMA 衰减率 |
-| `--output_dir` | str | ./checkpoints/vqvae | 输出目录 |
-| `--log_interval` | int | 1 | 日志打印间隔 (epochs) |
-| `--vis_interval` | int | 10 | 可视化+验证间隔 |
-| `--save_interval` | int | 20 | checkpoint 保存间隔 |
-| `--resume` | str | None | 恢复训练的 checkpoint 路径 |
-
-### train_latent_diffusion.py
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--vqvae_ckpt` | str | **必填** | Stage 1 VQVAE checkpoint 路径 |
-| `--vqvae_size` | str | small | VQVAE 规模: small, base, large |
-| `--dataset` | str | cifar10 | 数据集: cifar10, cifar100, imagenet |
+| `--dataset` | str | cifar10 | 数据集: cifar10, cifar100, imagenet, imagefolder |
 | `--data_dir` | str | ./data | 数据目录 |
-| `--image_size` | int | 32 | 图像尺寸 (须与 Stage 1 一致) |
-| `--dit_size` | str | S | DiT 规模: T, S, B |
-| `--num_timesteps` | int | 1000 | 扩散步数 |
+| `--image_size` | int | 256 | 输入图像尺寸 (FLUX VAE 最佳 256) |
+| `--dit_size` | str | B | DiT 规模: T, S, B |
+| `--patch_size` | int | 2 | DiT patch 大小 |
+| `--num_timesteps` | int | 1000 | 扩散时间步数 |
 | `--beta_schedule` | str | cosine | 噪声调度: linear, cosine |
 | `--pred_type` | str | v | 预测目标: eps, v |
-| `--min_snr_gamma` | float | 5.0 | min-SNR-γ 加权 |
-| `--svd_aux_weight` | float | 0.1 | SVD 辅助损失权重 |
-| `--use_svd_aux` | flag | True | 开启 SVD 辅助损失 |
-| `--no_svd_aux` | flag | - | 关闭 SVD 辅助损失 |
-| `--use_multiscale_cond` | flag | True | 开启多尺度条件 |
-| `--no_multiscale_cond` | flag | - | 关闭多尺度条件 |
-| `--cond_scales` | int[] | [1, 2] | 条件化的粗尺度列表 |
+| `--min_snr_gamma` | float | 5.0 | min-SNR-γ 截断值 |
+| `--svd_aux_weight` | float | 0.0 | SVD 辅助损失权重 (默认关闭) |
 | `--epochs` | int | 500 | 训练轮数 |
-| `--batch_size` | int | 128 | 批大小 |
-| `--lr` | float | 1e-4 | 初始学习率 |
-| `--min_lr` | float | 1e-6 | 最小学习率 |
-| `--warmup_epochs` | int | 10 | warmup 轮数 |
+| `--batch_size` | int | 256 | 批大小 |
+| `--lr` | float | 2e-4 | 初始学习率 |
+| `--min_lr` | float | 1e-6 | 最小学习率 (cosine annealing 终点) |
+| `--warmup_epochs` | int | 20 | linear warmup 轮数 |
 | `--ema_decay` | float | 0.9999 | EMA 衰减率 |
-| `--fid_interval` | int | 50 | FID 评估间隔 |
-| `--fid_n_samples` | int | 5000 | FID 评估样本数 |
+| `--grad_accum` | int | 1 | 梯度累积步数 |
+| `--max_train_samples` | int | 0 | 限制训练样本数 (0=全部) |
+| `--fid_interval` | int | 25 | FID 评估间隔 (epochs) |
+| `--fid_n_samples` | int | 2048 | FID 评估生成样本数 |
 | `--ddim_steps` | int | 50 | DDIM 采样步数 |
-| `--output_dir` | str | ./checkpoints/latent_diffusion | 输出目录 |
-| `--vis_interval` | int | 10 | 可视化间隔 |
-| `--save_interval` | int | 50 | checkpoint 保存间隔 |
-| `--resume` | str | None | 恢复训练路径 |
-
-### sample_latent_diffusion.py
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--vqvae_ckpt` | str | **必填** | VQVAE checkpoint |
-| `--vqvae_size` | str | small | VQVAE 规模: small, base, large |
-| `--dit_ckpt` | str | **必填** | DiT checkpoint |
-| `--dit_size` | str | S | DiT 规模: T, S, B |
-| `--use_cross_attn` | flag | True | 使用交叉注意力 |
-| `--no_cross_attn` | flag | - | 关闭交叉注意力 |
-| `--mode` | str | ddim | 模式: ddim, cascade, ddpm, eval, visualize |
-| `--ddim_steps` | int | 50 | DDIM 步数 |
-| `--n_samples` | int | 64 | 生成样本数 (ddim/cascade/ddpm) |
-| `--n_gen` | int | 10000 | eval 模式生成数量 |
-| `--batch_size` | int | 64 | 采样批大小 |
-| `--num_timesteps` | int | 1000 | 扩散步数 |
-| `--beta_schedule` | str | cosine | 噪声调度 |
-| `--pred_type` | str | v | 预测目标 |
-| `--dataset` | str | cifar10 | 数据集 (eval/visualize 需要) |
-| `--data_dir` | str | ./data | 数据目录 |
-| `--image_size` | int | 32 | 图像尺寸 |
-| `--output_dir` | str | ./samples | 输出目录 |
+| `--output_dir` | str | ./checkpoints/flux_latent_diffusion | 输出目录 |
+| `--vis_interval` | int | 5 | 可视化间隔 (epochs) |
+| `--save_interval` | int | 25 | checkpoint 保存间隔 |
+| `--resume` | str | None | 恢复训练的 checkpoint 路径 |
+| `--latent_cache_dir` | str | ./latent_cache | latent 缓存目录 |
+| `--use_amp` | flag | True | 使用 bf16 混合精度 |
+| `--compile` | flag | False | 使用 torch.compile 加速 |
 
 ---
 
-## 十、推荐配置
+## 七、输出文件说明
 
-### CIFAR-10 (32×32, 50k 训练样本)
+```
+checkpoints/flux_latent_diffusion/
+  best.pt              # 最佳 FID 的 checkpoint
+  epoch0025.pt         # 定期保存
+  epoch0050.pt
+  ...
+  final.pt             # 最终 epoch
+  vis/
+    samples_epoch0005.png   # DDIM 采样可视化 (8×8 网格)
+    samples_epoch0010.png
+    ...
 
-| 阶段 | model_size | dit_size | batch | lr | epochs | 预计显存 |
-|------|-----------|---------|-------|-----|--------|---------|
-| Stage 1 | small | - | 128 | 1e-3 | 200 | ~2GB |
-| Stage 2 | - | S | 128 | 1e-4 | 500 | ~3GB |
+latent_cache/
+  cifar10_train_256.pt       # CIFAR-10 训练集 latent 缓存
+  imagenet_train_256.pt      # ImageNet 训练集 latent 缓存
+  imagenet_train_256_50000.pt  # max_train_samples=50000 时的缓存
+```
 
-### ImageNet 64×64 (1.28M 训练样本)
-
-| 阶段 | model_size | dit_size | batch | lr | epochs | 预计显存 |
-|------|-----------|---------|-------|-----|--------|---------|
-| Stage 1 | large | - | 64 | 1e-3 | 100 | ~8GB |
-| Stage 2 | - | B | 64 | 1e-4 | 300 | ~12GB |
-
-### ImageNet 256×256
-
-| 阶段 | model_size | dit_size | batch | lr | epochs | 预计显存 |
-|------|-----------|---------|-------|-----|--------|---------|
-| Stage 1 | large | - | 16 | 5e-4 | 100 | ~16GB |
-| Stage 2 | - | B | 8 | 5e-5 | 300 | ~20GB |
+**Checkpoint 内容：**
+```python
+{
+    'epoch': int,
+    'model_state_dict': dict,     # DiT 模型权重
+    'optimizer_state_dict': dict, # AdamW 优化器状态
+    'ema_state_dict': dict,       # EMA 权重 (评估用)
+    'ema_decay': float,
+    'fid': float,                 # 当前最佳 FID
+    'channel_mean': Tensor,       # (16,) 逐通道均值
+    'channel_std': Tensor,        # (16,) 逐通道标准差
+}
+```
 
 ---
 
-## 十一、项目文件说明
+## 八、项目文件结构
 
 ```
 diffusion_torch/diffusion_torch/
- models/
-   ├── vqvae.py              (762行)  多尺度 VQVAE (VAR 风格)
-   └── dit.py                (630行)  DiT + 交叉注意力
- latent_diffusion.py        (583行)  潜空间扩散过程
- ema.py                     (111行)  EMA 滑动平均 + Checkpoint
- train_vqvae.py             (465行)  Stage 1 训练
- train_latent_diffusion.py  (562行)  Stage 2 训练
- sample_latent_diffusion.py (508行)  采样与评估
- fid_utils.py                        FID 计算工具
+  train_flux_latent_diffusion.py   # 主训练脚本 (FLUX VAE + DiT)
+  models/
+    dit.py                         # DiT 架构 (Transformer + adaLN-Zero)
+    vqvae.py                       # 多尺度 VQVAE (旧, 本流程不使用)
+  latent_diffusion.py              # 扩散过程 (噪声调度/损失/DDIM采样)
+  ema.py                           # EMA + checkpoint 工具
+  fid_utils.py                     # Inception-V3 特征提取
+  classifier_metrics_numpy.py      # FID 数值计算 (NumPy)
+  data/                            # 数据目录
+    cifar-10-batches-py/           # CIFAR-10 数据
+    imagenet_hf_cache/             # ImageNet HuggingFace 缓存
 ```
 
 ---
 
-## 十二、创新点总结
+## 九、CIFAR-10 实验结果
 
-| # | 创新点 | 说明 |
-|---|--------|------|
-| 1 | **多尺度 VQVAE (VAR 启发)** | 残差式多分辨率量化, 自然形成频率分解 |
-| 2 | **潜空间 SVD 辅助损失** | 在 VQVAE latent 空间做 SVD 投影, 引导低频/高频分别学习 |
-| 3 | **多尺度交叉注意力** | DiT 通过粗尺度条件接受全局结构信息 |
-| 4 | **多尺度级联采样** | 先去噪取低频 → SVD 截断 → 重加噪精修高频 |
-| 5 | **v-prediction + min-SNR-γ** | 稳定训练, 平衡不同噪声水平的梯度信号 |
-| 6 | **EMA 编码本** | 向量量化训练稳定, 无需大 codebook 也能避免坍缩 |
+### 训练配置
+- DiT-B (130M params), FLUX VAE (冻结)
+- 256×256 编码 → 32×32×16 latent → 逐通道归一化
+- v-prediction, cosine schedule, min-SNR-γ=5.0
+- AdamW (lr=2e-4), bf16 AMP, batch_size=256
+
+### FID 曲线 (2048 样本, 32×32)
+
+| Epoch | FID | 说明 |
+|-------|-----|------|
+| 25 | 428 | 初期噪声 |
+| 50 | 336 | 开始学到结构 |
+| 100 | 182 | 明显改善 |
+| 150 | 87 | 快速收敛阶段 |
+| 200 | 57 | |
+| 250 | 45 | |
+| 300 | 43 | 开始收敛 |
+| **350** | **42.64** | **最佳 FID** |
+| 375 | 43.13 | 略有上升 |
+
+> FID 在 ~350 epoch 后收敛到 ~42-43，可能因 CIFAR 的 32×32 分辨率上采样到 256×256 存在信息损失。ImageNet 原生 256×256 应有更好的效果。
 
 ---
 
-## 十三、自检清单
+## 十、理论背景
 
-| 检查项 | 结果 |
-|--------|------|
-| VQVAE 32×32: shape (3,32,32) → z(32,8,8) → recon(3,32,32) | ✅ |
-| VQVAE 64×64: shape (3,64,64) → z(64,8,8) → recon(3,64,64) | ✅ |
-| VQVAE 128×128: shape (3,128,128) → z(32,32,32) → recon(3,128,128) | ✅ |
-| VQVAE 256×256: shape (3,256,256) → z(64,32,32) → recon(3,256,256) | ✅ |
-| DiT latent_size=8 前向传播 | ✅ |
-| DiT latent_size=32 前向传播 (ImageNet) | ✅ |
-| v-prediction 数学可逆性 (误差 < 5e-7) | ✅ |
-| SVD 截断精确低秩 | ✅ |
-| 训练损失梯度回传 (130/130 DiT 参数) | ✅ |
-| DDIM 采样正确输出 | ✅ |
-| 多尺度级联采样正确输出 | ✅ |
-| DDPM 采样正确输出 | ✅ |
-| GPU 完整集成测试 (VQVAE→EMA→DiT→采样) | ✅ |
-| EMA apply_shadow/restore 正确性 | ✅ |
-| train_vqvae.py --dataset imagenet argparse | ✅ |
-| train_latent_diffusion.py --dataset imagenet argparse | ✅ |
-| sample_latent_diffusion.py --dataset imagenet argparse | ✅ |
-| 全部中文注释覆盖 | ✅ |
+### 10.1 为什么用预训练 VAE？
+
+传统两阶段方法需要自训练 VQVAE → 再训练扩散模型。使用 FLUX.1-dev 预训练 VAE 的优势：
+
+1. **跳过 Stage 1**: 无需训练 VQVAE，直接获得高质量连续潜在空间
+2. **更好的重建质量**: FLUX VAE 在 256×256 上 PSNR > 47dB
+3. **16 通道 latent**: 比 Stable Diffusion 的 4 通道保留更多信息
+4. **连续 latent**: 不需要向量量化，避免 codebook 坍缩等问题
+
+### 10.2 v-prediction vs ε-prediction
+
+v-prediction 定义: $v = \sqrt{\bar\alpha_t} \cdot \epsilon - \sqrt{1-\bar\alpha_t} \cdot x_0$
+
+优势：
+- 在高 SNR 端 (小 t) 不退化，训练信号更稳定
+- 与 min-SNR-γ 结合效果好
+- Progressive Distillation 友好
+
+### 10.3 min-SNR-γ 加权
+
+标准 MSE 损失在不同噪声水平下梯度量级差异大。min-SNR-γ 通过截断：
+
+$$w(t) = \frac{\min(\text{SNR}(t), \gamma)}{\text{SNR}(t)}$$
+
+平衡高低噪声水平的训练信号，$\gamma=5.0$ 是推荐默认值。
+
+### 10.4 为什么需要逐通道归一化？
+
+扩散模型的前向过程假设 $z_0 \sim \mathcal{N}(0, I)$，噪声 $\epsilon \sim \mathcal{N}(0, I)$。
+如果 $z_0$ 的各通道分布差异大 (如 FLUX VAE latent)，加噪/去噪过程中
+不同通道的信噪比不一致，影响训练效率和样本质量。
+
+逐通道归一化确保所有通道在同一尺度上，扩散过程假设成立。

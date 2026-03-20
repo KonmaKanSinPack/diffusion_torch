@@ -5,7 +5,8 @@ diffusion_torch/checkpoints/
 diffusion_torch/outputs/
 diffusion_torch/real_inception_acts.npy
 ./diffusion_torch/real_inception_acts.npy
-
+imagenet-data/
+latent_cache/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
